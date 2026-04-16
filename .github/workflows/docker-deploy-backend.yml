@@ -14,7 +14,7 @@ jobs:
   docker-push:
     name: "Build images and push to registry"
     # if: github.event.pull_request.merged == true
-    runs-on: [self-hosted, main]
+    runs-on: [self-hosted, testing]
 
     permissions:
       contents: read
