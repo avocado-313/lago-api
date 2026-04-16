@@ -1,0 +1,36 @@
+name: "Docker Deploy Lago Backend (Testing)"
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      sidekiq_pro:
+        type: boolean
+        default: true
+        description: Enable Sidekiq Pro
+
+jobs:
+  docker-push:
+    name: "Build images and push to registry"
+    # if: github.event.pull_request.merged == true
+    runs-on: [self-hosted, main]
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Login to DockerHub Registry
+        run: echo ${{ secrets.DOCKER_PASSWORD }} | docker login docker.io -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+      - name: Build image
+        run: docker build -t twerlo/avocado_billing:prd .
+
+      - name: Push image
+        run: docker push twerlo/avocado_billing:prd
