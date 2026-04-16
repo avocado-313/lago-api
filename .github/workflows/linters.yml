@@ -2,6 +2,11 @@ name: Linters
 on: [pull_request]
 permissions: {}
 jobs:
+  build:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "This job will never run"
   linters:
     name: Linters
     runs-on: ubuntu-latest

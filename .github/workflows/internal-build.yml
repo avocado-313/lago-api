@@ -11,6 +11,11 @@ on:
         description: Enable Sidekiq Pro
 permissions: {}
 jobs:
+  build:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "This job will never run"
   build-api-image:
     runs-on: ubuntu-latest
     name: Build API Image
