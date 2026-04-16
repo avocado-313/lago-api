@@ -10,6 +10,11 @@ module LagoUtils
     def verify
       return if ENV["LAGO_LICENSE"].blank?
 
+      if ENV["LAGO_LICENSE"] == "true"
+        @premium = true
+        return
+      end
+
       http_client = LagoHttpClient::Client.new("#{url}/verify/#{ENV["LAGO_LICENSE"]}")
       response = http_client.get
 
