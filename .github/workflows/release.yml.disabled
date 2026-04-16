@@ -11,11 +11,6 @@ env:
   REGISTRY_IMAGE: getlago/api
 permissions: { }
 jobs:
-  build:
-    if: false
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "This job will never run"
   build-images:
     strategy:
       matrix:

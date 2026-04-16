@@ -7,11 +7,6 @@ on:
     types: [opened, synchronize, reopened]
 permissions: {}
 jobs:
-  build:
-    if: false
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "This job will never run"
   run-spec:
     name: Run Spec
     runs-on: ubuntu-latest
