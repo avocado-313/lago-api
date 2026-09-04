@@ -1,0 +1,225 @@
+# =============================================================================
+# Reusable k8s build+deploy pipeline — azeer-billing-api (this fork).
+# =============================================================================
+# A port of avocado-313/core's _build-deploy.yml to a Rails repo: tag → gate →
+# buildx → immutable tag to Artifact Registry via keyless WIF → a PR against
+# azeer-infra bumping this image's tag in the billing values file. MERGING
+# THAT PR IS THE DEPLOY (ArgoCD auto-syncs: PreSync migrate Job from this
+# image, then rolling api/worker, Recreate clock — see azeer-infra
+# docs/runbooks/billing-deploy.md).
+#
+# Differences from core's, all deliberate:
+#   - the gate is `bundle exec rubocop` (no Go module to compile); the Rails
+#     boot + migration check happens in the PreSync Job at deploy time;
+#   - LAGO_VERSION is written before the build so the running app reports
+#     the image tag instead of "production" (the file is read at boot;
+#     .dockerignore does not exclude it);
+#   - the deploy PR bumps a NESTED key (.api.image.tag) — two images share
+#     one values file — so `values-path` is an input rather than hardcoded;
+#   - open-source Sidekiq: no BUNDLE_GEMS__CONTRIBSYS__COM build secret.
+#
+# TRANSIT: azeer-billing is sunset 2026-10-05 (azeer-infra runbook).
+
+name: _build-deploy
+
+on:
+  workflow_call:
+    inputs:
+      product:
+        description: "Short product key (branch names, PR titles): billing-api"
+        required: true
+        type: string
+      image:
+        description: "Full image path (no tag)"
+        required: true
+        type: string
+      dockerfile:
+        description: "Dockerfile to build"
+        required: true
+        type: string
+      values-file:
+        description: "azeer-infra values file the deploy PR bumps"
+        required: true
+        type: string
+      values-path:
+        description: "yq path of the tag inside values-file, e.g. .api.image.tag"
+        required: true
+        type: string
+      version-ref:
+        description: "Ref/tag (or dispatch input) to derive the sX.Y[.Z] version from"
+        required: true
+        type: string
+    secrets:
+      INFRA_DEPLOY_TOKEN:
+        required: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      - name: Lint (rubocop, errors only)
+        run: bundle exec rubocop --fail-level error --format quiet
+
+  build-push:
+    needs: [gate]
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.version.outputs.image_tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        name: Derive version from the release ref
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -oE 's[0-9]+\.[0-9]+(\.[0-9]+)?$' <<<"${{ inputs.version-ref }}" || true)"
+          if [[ -z "${VERSION}" ]]; then
+            echo "::error::cannot derive an sX.Y[.Z] version from '${{ inputs.version-ref }}'"
+            exit 1
+          fi
+          SHA9="$(git rev-parse --short=9 HEAD)"
+          echo "version=${VERSION}"            >> "$GITHUB_OUTPUT"
+          echo "image_tag=${VERSION}-${SHA9}"  >> "$GITHUB_OUTPUT"
+          echo "Building ${VERSION}-${SHA9}"
+
+      - name: Stamp LAGO_VERSION (read by the app at boot; /health and metrics report it)
+        run: echo "${{ steps.version.outputs.image_tag }}" > LAGO_VERSION
+
+      - id: auth
+        name: Authenticate to GCP via WIF (keyless)
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: projects/190106386859/locations/global/workloadIdentityPools/github-actions/providers/github-actions
+          service_account: ci-image-push@azeer-prod.iam.gserviceaccount.com
+
+      - name: Login to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: me-central2-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+          tags: |
+            ${{ inputs.image }}:${{ steps.version.outputs.image_tag }}
+            ${{ inputs.image }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-pr:
+    needs: [build-push]
+    # !cancelled() + explicit result check, NOT the implicit success() (core's
+    # s69.0.12 lesson: success() is false when any ancestor was skipped).
+    if: ${{ !cancelled() && needs.build-push.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo (full history — for the migrations diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: src
+
+      - name: Checkout azeer-infra
+        uses: actions/checkout@v4
+        with:
+          repository: avocado-313/azeer-infra
+          token: ${{ secrets.INFRA_DEPLOY_TOKEN }}
+          path: infra
+
+      - name: List migrations new since the previously deployed tag
+        id: migdiff
+        working-directory: src
+        env:
+          VALUES_FILE: ${{ inputs.values-file }}
+          VALUES_PATH: ${{ inputs.values-path }}
+        run: |
+          set -euo pipefail
+          YQ=/tmp/yq
+          wget -qO "$YQ" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          chmod +x "$YQ"
+          PREV_TAG="$("$YQ" -r "${VALUES_PATH}" "../infra/${VALUES_FILE}")"
+          PREV_SHA="${PREV_TAG##*-}"
+          {
+            echo "list<<EOF"
+            if [[ -n "$PREV_SHA" ]] && git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
+              DIFF="$(git diff --name-only --diff-filter=A "${PREV_SHA}..HEAD" -- db/migrate | sed 's/^/- /')"
+              [[ -n "$DIFF" ]] && echo "$DIFF" || echo "- (none)"
+            else
+              echo "- (could not diff against previously deployed sha — review db/migrate manually)"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Bump the image tag and open PR
+        working-directory: infra
+        env:
+          GH_TOKEN: ${{ secrets.INFRA_DEPLOY_TOKEN }}
+          IMAGE_TAG: ${{ needs.build-push.outputs.image_tag }}
+          VERSION: ${{ needs.build-push.outputs.version }}
+          VALUES_FILE: ${{ inputs.values-file }}
+          VALUES_PATH: ${{ inputs.values-path }}
+          PRODUCT: ${{ inputs.product }}
+          MIG_LIST: ${{ steps.migdiff.outputs.list }}
+          VERSION_REF: ${{ inputs.version-ref }}
+        run: |
+          set -euo pipefail
+          PR_PREFIX="deploy(${PRODUCT})"
+          BRANCH="deploy/${PRODUCT}-${IMAGE_TAG}"
+
+          # Pinned mikefarah yq (NOT the python-wrapper `yq` — different tool, same name)
+          YQ=/tmp/yq
+          wget -qO "$YQ" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          chmod +x "$YQ"
+
+          "$YQ" -i "${VALUES_PATH} = \"${IMAGE_TAG}\" | ${VALUES_PATH} line_comment=\"${VERSION} — ${GITHUB_REPOSITORY}@${GITHUB_SHA:0:9} via ${PR_PREFIX}\"" "$VALUES_FILE"
+
+          git config user.name  "billing-deploy-bot"
+          git config user.email "platform-ops@twerlo.com"
+          git checkout -b "$BRANCH"
+          git add "$VALUES_FILE"
+          git commit -m "${PR_PREFIX}: ${IMAGE_TAG}"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --repo avocado-313/azeer-infra \
+            --base main \
+            --head "$BRANCH" \
+            --title "${PR_PREFIX}: ${IMAGE_TAG}" \
+            --body "$(cat <<PRBODY
+          ## ${PR_PREFIX} — \`${IMAGE_TAG}\`
+
+          Built from [\`${GITHUB_REPOSITORY}@${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}) (ref \`${VERSION_REF}\`).
+
+          **Merging this PR deploys to prod**: ArgoCD auto-syncs \`main\` — PreSync
+          \`billing-migrate\` Job (rails db:migrate from this image), then rolling
+          api/worker and the Recreate clock singleton. See
+          \`docs/runbooks/billing-deploy.md\`. TRANSIT product, sunset 2026-10-05.
+
+          ### New migrations in this release
+          ${MIG_LIST}
+
+          ### Reviewer checklist
+          - [ ] Migrations (if any) are expand/contract-safe — old api pods keep serving while the rollout runs
+          - [ ] Upstream rebase kept the fork's license shim (lib/lago_utils/lago_utils/license.rb) — every premium feature depends on it
+          PRBODY
+          )"

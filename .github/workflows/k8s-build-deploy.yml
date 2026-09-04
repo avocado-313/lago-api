@@ -1,0 +1,43 @@
+# k8s release pipeline — azeer-billing-api. Thin wrapper; all logic lives in
+# _build-deploy.yml (a port of core's). Triggered by the same tag family the
+# team cuts elsewhere (production/release-s*, production/hotfix*). Merging
+# the PR this opens IS the prod deploy.
+#
+# TRANSIT: azeer-billing is sunset 2026-10-05 (azeer-infra
+# docs/runbooks/billing-deploy.md). The legacy Docker Hub build
+# (docker-deploy-backend.yml.disabled) fed the previous self-hosted test
+# instance and is retired.
+
+name: k8s-build-deploy
+
+on:
+  push:
+    tags:
+      - "production/release-s*"
+      - "production/hotfix*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp, e.g. s1.0.0 (image tag becomes <version>-<sha9>)"
+        required: true
+
+permissions:
+  contents: read
+  id-token: write # OIDC for WIF — the whole keyless mechanism
+
+concurrency:
+  group: k8s-build-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    uses: ./.github/workflows/_build-deploy.yml
+    with:
+      product: billing-api
+      image: me-central2-docker.pkg.dev/azeer-prod/azeer-billing-api/api
+      dockerfile: Dockerfile
+      values-file: deploy/helm/azeer-billing/azeer-billing-umbrella/values-gcp-me-central2-prod.yaml
+      values-path: .api.image.tag
+      version-ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+    secrets:
+      INFRA_DEPLOY_TOKEN: ${{ secrets.INFRA_DEPLOY_TOKEN }}
