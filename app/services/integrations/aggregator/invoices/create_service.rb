@@ -4,7 +4,14 @@ module Integrations
   module Aggregator
     module Invoices
       class CreateService < BaseService
+        Result = BaseResult[:invoice_id, :external_id]
+
         INVALID_LOGIN_ATTEMPT = "INVALID_LOGIN_ATTEMPT"
+
+        def initialize(invoice:, find_first: false)
+          @find_first = find_first
+          super(invoice:)
+        end
 
         def action_path
           "v1/#{provider}/invoices"
@@ -65,13 +72,15 @@ module Integrations
         def call_async
           return result.not_found_failure!(resource: "invoice") unless invoice
 
-          ::Integrations::Aggregator::Invoices::CreateJob.perform_later(invoice:)
+          ::Integrations::Aggregator::Invoices::CreateJob.perform_later(invoice:, find_first:)
 
           result.invoice_id = invoice.id
           result
         end
 
         private
+
+        attr_reader :find_first
 
         def process_hash_result(body)
           external_id = body["succeededInvoices"]&.first.try(:[], "id")

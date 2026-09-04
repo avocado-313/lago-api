@@ -16,6 +16,7 @@ RSpec.describe Types::ActivityLogs::ActivityTypeEnum do
         customer_updated
         customer_deleted
         invoice_drafted
+        invoice_ready_to_finalize
         invoice_failed
         invoice_one_off_created
         invoice_created
@@ -24,6 +25,7 @@ RSpec.describe Types::ActivityLogs::ActivityTypeEnum do
         invoice_payment_status_updated
         invoice_payment_overdue
         invoice_voided
+        invoice_deleted
         invoice_regenerated
         invoice_payment_failure
         payment_receipt_created
@@ -34,6 +36,8 @@ RSpec.describe Types::ActivityLogs::ActivityTypeEnum do
         billing_entities_created
         billing_entities_updated
         billing_entities_deleted
+        subscription_canceled
+        subscription_incomplete
         subscription_started
         subscription_terminated
         subscription_updated
@@ -52,7 +56,31 @@ RSpec.describe Types::ActivityLogs::ActivityTypeEnum do
         feature_created
         feature_deleted
         feature_updated
+        product_category_created
+        product_category_updated
+        product_category_deleted
+        product_created
+        product_updated
+        product_deleted
+        product_filter_created
+        product_filter_updated
+        product_filter_deleted
+        rate_card_created
+        rate_card_updated
+        rate_card_deleted
         email_sent
+        quote_created
+        quote_updated
+        quote_approved
+        quote_voided
+        quote_version_created
+        order_form_created
+        order_form_signed
+        order_form_file_uploaded
+        order_form_expired
+        order_form_voided
+        order_created
+        order_executed
       ]
     )
   end

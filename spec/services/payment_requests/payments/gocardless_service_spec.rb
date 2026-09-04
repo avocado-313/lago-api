@@ -3,8 +3,6 @@
 require "rails_helper"
 
 RSpec.describe PaymentRequests::Payments::GocardlessService do
-  subject(:gocardless_service) { described_class.new(payment_request) }
-
   let(:organization) { create(:organization, webhook_url: "https://webhook.com") }
   let(:customer) { create(:customer, organization:, payment_provider_code: code) }
   let(:gocardless_payment_provider) { create(:gocardless_provider, organization:, code:) }
@@ -48,9 +46,11 @@ RSpec.describe PaymentRequests::Payments::GocardlessService do
     )
   end
 
-  describe "#update_payment_status" do
+  describe ".call(:update_payment_status)" do
     subject(:result) do
-      gocardless_service.update_payment_status(provider_payment_id:, status:)
+      described_class.call(
+        :update_payment_status, provider_payment_id:, status:
+      )
     end
 
     let(:status) { "paid_out" }
@@ -68,8 +68,6 @@ RSpec.describe PaymentRequests::Payments::GocardlessService do
     let(:provider_payment_id) { "ch_123456" }
 
     before do
-      allow(SegmentTrackJob).to receive(:perform_later)
-      allow(SendWebhookJob).to receive(:perform_later)
       payment
     end
 
@@ -116,10 +114,11 @@ RSpec.describe PaymentRequests::Payments::GocardlessService do
         )
       end
 
-      it "resets the customer dunning campaign counters" do
+      it "resets the customer dunning campaign counters for the payment request currency" do
         expect { result && customer.reload }
           .to change(customer, :last_dunning_campaign_attempt).to(0)
           .and change(customer, :last_dunning_campaign_attempt_at).to(nil)
+          .and change(customer, :dunning_currency_attempts).to({"USD" => 0})
 
         expect(result).to be_success
       end
@@ -197,6 +196,26 @@ RSpec.describe PaymentRequests::Payments::GocardlessService do
       end
     end
 
+    context "when a failed webhook arrives after the invoice was already paid through another path" do
+      let(:status) { "failed" }
+
+      before do
+        payment_request.payment_failed!
+        invoice_1.payment_succeeded!
+        invoice_2.payment_succeeded!
+      end
+
+      it "leaves already-succeeded invoices untouched" do
+        expect { result }
+          .to not_change { invoice_1.reload.payment_status }
+          .and not_change { invoice_2.reload.payment_status }
+
+        expect(result).to be_success
+        expect(invoice_1.reload).to be_payment_succeeded
+        expect(invoice_2.reload).to be_payment_succeeded
+      end
+    end
+
     context "with invalid status" do
       let(:status) { "invalid-status" }
 
@@ -217,33 +236,6 @@ RSpec.describe PaymentRequests::Payments::GocardlessService do
 
       it "does not send payment requested email" do
         expect { result }.not_to have_enqueued_mail(PaymentRequestMailer, :requested)
-      end
-    end
-
-    context "when payment request is not passed to constructor" do
-      let(:gocardless_service) { described_class.new(nil) }
-      let(:status) { "paid_out" }
-
-      before do
-        payment_request
-      end
-
-      it "updates the payment and invoice payment_status" do
-        expect(result).to be_success
-        expect(result.payment.status).to eq(status)
-        expect(result.payment.payable_payment_status).to eq("succeeded")
-
-        expect(result.payable).to be_payment_succeeded
-        expect(result.payable.ready_for_payment_processing).to eq(false)
-
-        expect(invoice_1.reload).to be_payment_succeeded
-        expect(invoice_1.ready_for_payment_processing).to eq(false)
-
-        expect(invoice_2.reload).to be_payment_succeeded
-        expect(invoice_2.ready_for_payment_processing).to eq(false)
-
-        expect(invoice_1.total_paid_amount_cents).to eq(0)
-        expect(invoice_2.total_paid_amount_cents).to eq(0)
       end
     end
   end

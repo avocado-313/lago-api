@@ -8,6 +8,7 @@ module V1
         billing_entity_code: model.billing_entity.code,
         sequential_id: model.sequential_id,
         number: model.number,
+        purchase_order_number: model.purchase_order_number,
         issuing_date: model.issuing_date&.iso8601,
         payment_due_date: model.payment_due_date&.iso8601,
         net_payment_term: model.net_payment_term,
@@ -33,6 +34,7 @@ module V1
         prepaid_purchased_credit_amount_cents: model.prepaid_purchased_credit_amount_cents,
         file_url: model.file_url,
         xml_url: model.xml_url,
+        web_url: model.web_url,
         version_number: model.version_number,
         self_billed: model.self_billed,
         created_at: model.created_at.iso8601,
@@ -93,6 +95,7 @@ module V1
             :customer,
             :charge,
             :billable_metric,
+            :presentation_breakdowns,
             {charge_filter: {values: :billable_metric_filter}}
           ]
         ),

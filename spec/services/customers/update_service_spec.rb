@@ -46,8 +46,6 @@ RSpec.describe Customers::UpdateService do
     let(:account_type) { "customer" }
 
     it "updates a customer and calls SendWebhookJob" do
-      allow(SendWebhookJob).to receive(:perform_later)
-
       result = customers_service.call
       updated_customer = result.customer
       expect(updated_customer.name).to eq(update_args[:name])
@@ -60,13 +58,40 @@ RSpec.describe Customers::UpdateService do
 
       shipping_address = update_args[:shipping_address]
       expect(updated_customer.shipping_city).to eq(shipping_address[:city])
-      expect(SendWebhookJob).to have_received(:perform_later).with("customer.updated", updated_customer)
+      expect(SendWebhookJob).to have_been_enqueued.with("customer.updated", updated_customer)
     end
 
     it "produces an activity log" do
       described_class.call(customer:, args: update_args)
 
       expect(Utils::ActivityLog).to have_produced("customer.updated").after_commit.with(customer)
+    end
+
+    it "refreshes the invoices search terms when a searchable field changes" do
+      expect { customers_service.call }
+        .to have_enqueued_job_after_commit(Customers::RefreshInvoicesSearchTermsJob).with(customer.id)
+    end
+
+    context "when no searchable field changes" do
+      let(:update_args) { {id: customer.id, net_payment_term: 8} }
+
+      it "does not refresh the invoices search terms" do
+        expect { customers_service.call }.not_to have_enqueued_job(Customers::RefreshInvoicesSearchTermsJob)
+      end
+    end
+
+    context "with email containing unicode lookalike characters" do
+      let(:update_args) do
+        {
+          id: customer.id,
+          email: "hello@something\u2013other.com"
+        }
+      end
+
+      it "sanitizes the email before saving" do
+        result = customers_service.call
+        expect(result.customer.email).to eq("hello@something-other.com")
+      end
     end
 
     context "when updating the billing entity reference" do
@@ -103,10 +128,10 @@ RSpec.describe Customers::UpdateService do
           create(:subscription, customer:)
         end
 
-        it "does not update the billing entity" do
+        it "updates the billing entity" do
           result = customers_service.call
           expect(result).to be_success
-          expect(result.customer.billing_entity).to eq(billing_entity)
+          expect(result.customer.billing_entity).to eq(billing_entity_2)
         end
       end
     end
@@ -282,13 +307,11 @@ RSpec.describe Customers::UpdateService do
           }
         end
 
-        it "fails" do
+        it "updates the currency" do
           result = customers_service.call
 
-          expect(result).not_to be_success
-          expect(result.error).to be_a(BaseService::ValidationFailure)
-          expect(result.error.messages.keys).to include(:currency)
-          expect(result.error.messages[:currency]).to include("currencies_does_not_match")
+          expect(result).to be_success
+          expect(result.customer.currency).to eq("CAD")
         end
       end
     end
@@ -310,7 +333,7 @@ RSpec.describe Customers::UpdateService do
         allow(PaymentProviderCustomers::UpdateService)
           .to receive(:call)
           .with(customer)
-          .and_return(BaseService::Result.new)
+          .and_return(PaymentProviderCustomers::UpdateService::Result.new)
       end
 
       it "creates a payment provider customer" do
@@ -375,7 +398,7 @@ RSpec.describe Customers::UpdateService do
             customer.update!(payment_provider: "stripe")
           end
 
-          it "removes the provider customer id" do
+          it "discards the provider customer" do
             result = customers_service.call
 
             expect(result).to be_success
@@ -384,8 +407,7 @@ RSpec.describe Customers::UpdateService do
             expect(result_customer.id).to eq(customer.id)
             expect(result_customer.payment_provider).to be_nil
 
-            expect(result_customer.stripe_customer).to eq(stripe_customer)
-            expect(result_customer.stripe_customer.provider_customer_id).to be_nil
+            expect(stripe_customer.reload).to be_discarded
           end
         end
       end
@@ -430,13 +452,11 @@ RSpec.describe Customers::UpdateService do
         expect(customer.payment_provider_code).to be_nil
       end
 
-      # NOTE: This describes a scenario with incorrect behavior that currently exists.
-      #       The previous provider customer is not discarded
-      it "does not discard the provider customer" do
+      it "discards the provider customer" do
         result = customers_service.call
 
         expect(result).to be_success
-        expect(stripe_customer.reload).not_to be_discarded
+        expect(stripe_customer.reload).to be_discarded
       end
 
       it "discards the payment methods" do
@@ -444,6 +464,25 @@ RSpec.describe Customers::UpdateService do
 
         expect(result).to be_success
         expect(payment_method.reload).to be_discarded
+      end
+
+      context "when a non-nil payment_provider_code is still provided" do
+        let(:update_args) do
+          {
+            id: customer.id,
+            organization_id: organization.id,
+            payment_provider: nil,
+            provider_customer: nil,
+            payment_provider_code:
+          }
+        end
+
+        it "wipes out the payment_provider_code" do
+          result = customers_service.call
+
+          expect(result).to be_success
+          expect(result.customer.payment_provider_code).to be_nil
+        end
       end
     end
 
@@ -604,6 +643,101 @@ RSpec.describe Customers::UpdateService do
           expect(result).to be_success
 
           expect(result.customer.taxes).to eq([])
+        end
+      end
+    end
+
+    context "when the billing entity changes and entities have different EU tax settings" do
+      let(:eu_billing_entity) { create(:billing_entity, organization:, country: "FR", eu_tax_management: true) }
+      let(:other_eu_billing_entity) { create(:billing_entity, organization:, country: "DE", eu_tax_management: true) }
+      let(:non_eu_billing_entity) { create(:billing_entity, organization:, country: "US", eu_tax_management: false) }
+
+      let(:fr_tax) { create(:tax, organization:, code: "lago_eu_fr_standard", rate: 20.0) }
+      let(:de_tax) { create(:tax, organization:, code: "lago_eu_de_standard", rate: 19.0) }
+
+      let(:customer) { create(:customer, organization:, billing_entity: source_billing_entity, country: nil, zipcode: nil) }
+
+      let(:update_args) { {id: customer.id, billing_entity_code: target_billing_entity.code} }
+
+      before do
+        fr_tax
+        de_tax
+        create(:customer_applied_tax, organization:, customer:, tax: applied_tax) if applied_tax
+      end
+
+      context "when moving from an EU entity to a non-EU entity" do
+        let(:source_billing_entity) { eu_billing_entity }
+        let(:target_billing_entity) { non_eu_billing_entity }
+        let(:applied_tax) { fr_tax }
+
+        it "resets the EU tax so the customer falls back to the billing entity" do
+          result = customers_service.call
+
+          expect(result).to be_success
+          expect(result.customer.billing_entity).to eq(non_eu_billing_entity)
+          expect(result.customer.taxes).to eq([])
+        end
+      end
+
+      context "when moving from a non-EU entity to an EU entity" do
+        let(:source_billing_entity) { non_eu_billing_entity }
+        let(:target_billing_entity) { eu_billing_entity }
+        let(:applied_tax) { nil }
+
+        it "assigns the new billing entity EU tax" do
+          result = customers_service.call
+
+          expect(result).to be_success
+          expect(result.customer.billing_entity).to eq(eu_billing_entity)
+          expect(result.customer.taxes.pluck(:code)).to eq(["lago_eu_fr_standard"])
+        end
+      end
+
+      context "when moving between two EU entities in different countries" do
+        let(:source_billing_entity) { eu_billing_entity }
+        let(:target_billing_entity) { other_eu_billing_entity }
+        let(:applied_tax) { fr_tax }
+
+        it "re-evaluates the EU tax against the new billing entity" do
+          result = customers_service.call
+
+          expect(result).to be_success
+          expect(result.customer.billing_entity).to eq(other_eu_billing_entity)
+          expect(result.customer.taxes.pluck(:code)).to eq(["lago_eu_de_standard"])
+        end
+      end
+
+      context "when the new EU entity requires a VIES check" do
+        let(:source_billing_entity) { eu_billing_entity }
+        let(:target_billing_entity) { other_eu_billing_entity }
+        let(:applied_tax) { fr_tax }
+
+        let(:customer) do
+          create(:customer, organization:, billing_entity: source_billing_entity, country: nil, zipcode: nil, tax_identification_number: "FR123456789")
+        end
+
+        it "resets the EU tax and schedules a VIES check for the new billing entity" do
+          result = customers_service.call
+
+          expect(result).to be_success
+          expect(result.customer.taxes).to eq([])
+          expect(customer.reload.pending_vies_check).to have_attributes(
+            billing_entity: other_eu_billing_entity,
+            tax_identification_number: "FR123456789"
+          )
+        end
+      end
+
+      context "when the billing entity does not change" do
+        let(:source_billing_entity) { eu_billing_entity }
+        let(:target_billing_entity) { eu_billing_entity }
+        let(:applied_tax) { fr_tax }
+
+        it "keeps the existing customer tax" do
+          result = customers_service.call
+
+          expect(result).to be_success
+          expect(result.customer.taxes.pluck(:code)).to eq(["lago_eu_fr_standard"])
         end
       end
     end

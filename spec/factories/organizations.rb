@@ -7,19 +7,21 @@ FactoryBot.define do
     end
 
     name { Faker::Company.name }
+    sequence(:slug) { |n| "test-org-#{n}" }
     default_currency { "USD" }
     audit_logs_period { nil }
 
     email { Faker::Internet.email }
     email_settings { ["invoice.finalized", "credit_note.created"] }
 
-    api_keys { [association(:api_key, organization: instance)] }
+    api_keys { [association(:api_key, organization: instance, strategy: :build)] }
     billing_entities do
       [
         association(
           :billing_entity,
           *(with_static_values ? [:with_static_values] : []),
-          organization: instance
+          organization: instance,
+          strategy: :build
         )
       ]
     end
@@ -57,6 +59,7 @@ FactoryBot.define do
       with_static_values { true }
 
       name { "ACME Corporation" }
+      slug { "acme-corp" }
       default_currency { "USD" }
       country { "US" }
     end

@@ -61,13 +61,13 @@ describe "Add customer-specific taxes" do
       expect(Customer.find_by(external_id: "user_fr_123").taxes.sole.code).to eq "lago_eu_fr_standard"
 
       create_or_update_customer(italian_attributes.merge(external_id: "user_it_123"))
-      expect(Customer.find_by(external_id: "user_it_123").taxes.sole.code).to eq "lago_eu_fr_standard"
+      expect(Customer.find_by(external_id: "user_it_123").taxes.sole.code).to eq "lago_eu_it_standard"
 
       webhooks_sent.clear
       # Update customer to provide an INVALID EU VAT identifier
       # Nothing changes and no API call is made
       create_or_update_customer({external_id: "user_it_123", tax_identification_number: "IT123"})
-      expect(Customer.find_by(external_id: "user_it_123").taxes.reload.sole.code).to eq "lago_eu_fr_standard"
+      expect(Customer.find_by(external_id: "user_it_123").taxes.reload.sole.code).to eq "lago_eu_it_standard"
       expect(webhooks_sent.find { it["webhook_type"] == "customer.vies_check" }.dig("customer", "vies_check")).to eq({
         "valid" => false,
         "valid_format" => false
@@ -81,13 +81,13 @@ describe "Add customer-specific taxes" do
       create_or_update_customer({external_id: "user_it_123", tax_identification_number: "IT12345678901"})
       expect(Customer.find_by(external_id: "user_it_123").taxes.reload.sole.code).to eq "lago_eu_reverse_charge"
       expect(webhooks_sent.find { it["webhook_type"] == "customer.vies_check" }.dig("customer", "vies_check")).to eq({
-        "countryCode" => "IT",
-        "vatNumber" => "IT12345678901"
+        "country_code" => "IT",
+        "vat_number" => "IT12345678901"
       })
 
       mock_vies_check!("FR12345678901")
       create_or_update_customer({external_id: "user_fr_123", tax_identification_number: "FR12345678901"})
-      expect(Customer.find_by(external_id: "user_fr_123").taxes.sole.code).to eq "lago_eu_reverse_charge"
+      expect(Customer.find_by(external_id: "user_fr_123").taxes.sole.code).to eq "lago_eu_fr_standard"
 
       customer = Customer.find_by(external_id: "user_it_123")
       # If I had a custom tax for this Customer
@@ -104,13 +104,11 @@ describe "Add customer-specific taxes" do
       # Then, remove the tax_identification_number for the customer
       # The custom tax is overridden by the default VAT of the country, even if an invoice used the previous taxes
       create_or_update_customer({external_id: customer.external_id, tax_identification_number: nil})
-      expect(customer.taxes.sole.code).to eq "lago_eu_fr_standard"
+      expect(customer.taxes.sole.code).to eq "lago_eu_it_standard"
     end
   end
 
   context "when VIES returns an error" do
-    let(:retry_job) { class_double(Customers::ViesCheckJob) }
-
     it "does not change taxes but send the webhook" do
       enable_eu_tax_management!
 
@@ -122,11 +120,16 @@ describe "Add customer-specific taxes" do
       allow_any_instance_of(Valvat).to receive(:exists?) # rubocop:disable RSpec/AnyInstance
         .and_raise(::Valvat::RateLimitError.new("rate limit exceeded", Valvat::Lookup::VIES))
 
-      allow(Customers::ViesCheckJob).to receive(:set).and_return retry_job
-      allow(retry_job).to receive(:perform_later)
+      # Perform the failing VIES check without draining the delayed retry it schedules,
+      # since performing the retry would fail VIES again and re-enqueue forever.
+      create_or_update_customer({external_id: "user_fr_123", tax_identification_number: vat_number}, perform_jobs: false)
+      perform_enqueued_jobs(only: Customers::ViesCheckJob)
+      perform_all_enqueued_jobs(except: [Customers::ViesCheckJob])
 
-      create_or_update_customer({external_id: "user_fr_123", tax_identification_number: vat_number})
-
+      # The failing check scheduled a delayed retry, which is still in the queue.
+      # `have_been_enqueued` is avoided here because it is unreliable after the
+      # perform_all_enqueued_jobs drain loop (see QueuesHelper).
+      expect(enqueued_jobs(only: [Customers::ViesCheckJob])).not_to be_empty
       expect(Customer.find_by(external_id: "user_fr_123").taxes.reload.sole.code).to eq "lago_eu_fr_standard"
       expect(webhooks_sent.find { it["webhook_type"] == "customer.vies_check" }.dig("customer", "vies_check")).to eq({
         "valid" => false,
@@ -138,22 +141,31 @@ describe "Add customer-specific taxes" do
 
   context "when VIES fails and invoice is blocked until retry succeeds" do
     let(:vat_number) { "IT12345678901" }
-    let(:retry_job) { class_double(Customers::ViesCheckJob) }
 
     def setup_customer_with_pending_vies_check!
       enable_eu_tax_management!
 
       create_or_update_customer(italian_attributes.merge(external_id: "user_it_123"))
       customer = Customer.find_by(external_id: "user_it_123")
-      expect(customer.taxes.sole.code).to eq "lago_eu_fr_standard"
+      expect(customer.taxes.sole.code).to eq "lago_eu_it_standard"
 
       # Update with VAT number - VIES fails
       allow_any_instance_of(Valvat).to receive(:exists?) # rubocop:disable RSpec/AnyInstance
         .and_raise(::Valvat::RateLimitError.new("rate limit exceeded", Valvat::Lookup::VIES))
-      allow(Customers::ViesCheckJob).to receive(:set).and_return(retry_job)
-      allow(retry_job).to receive(:perform_later)
 
-      create_or_update_customer({external_id: "user_it_123", tax_identification_number: vat_number})
+      # Perform the failing VIES check without draining the delayed retry it schedules,
+      # since performing the retry would fail VIES again and re-enqueue forever.
+      create_or_update_customer({external_id: "user_it_123", tax_identification_number: vat_number}, perform_jobs: false)
+      perform_enqueued_jobs(only: Customers::ViesCheckJob)
+      perform_all_enqueued_jobs(except: [Customers::ViesCheckJob])
+
+      # Drop the scheduled retry so the rest of the scenario controls when VIES resolves.
+      # The adapter queue is inspected and mutated directly: `have_been_enqueued` is
+      # unreliable after the perform_all_enqueued_jobs drain loop (see QueuesHelper),
+      # and QueuesHelper#enqueued_jobs returns a filtered copy, which makes
+      # clear_enqueued_jobs a no-op.
+      expect(enqueued_jobs(only: [Customers::ViesCheckJob])).not_to be_empty
+      queue_adapter.enqueued_jobs.reject! { |job| job[:job] == Customers::ViesCheckJob }
 
       expect(customer.reload.pending_vies_check).to be_present
       expect(customer.vies_check_in_progress?).to be true
@@ -323,7 +335,7 @@ describe "Add customer-specific taxes" do
       expect(customer.reload.taxes.sole.code).to eq "lago_eu_fr_standard"
 
       create_or_update_customer({external_id: customer.external_id, country: "DE"})
-      expect(customer.reload.taxes.sole.code).to eq "lago_eu_fr_standard"
+      expect(customer.reload.taxes.sole.code).to eq "lago_eu_de_standard"
     end
   end
 
@@ -333,7 +345,7 @@ describe "Add customer-specific taxes" do
 
       create_or_update_customer(italian_attributes.merge(external_id: "user_it_123"))
       customer = Customer.find_by(external_id: "user_it_123")
-      expect(customer.taxes.sole.code).to eq "lago_eu_fr_standard"
+      expect(customer.taxes.sole.code).to eq "lago_eu_it_standard"
 
       # Make an invoice with another tax
       create_tax({name: "Banking rates", code: "banking_rates", rate: 1.3})
@@ -342,7 +354,7 @@ describe "Add customer-specific taxes" do
       expect(customer.invoices.sole.taxes.sole.code).to eq "banking_rates"
 
       # The customer tax is unaffected
-      expect(customer.taxes.sole.code).to eq "lago_eu_fr_standard"
+      expect(customer.taxes.sole.code).to eq "lago_eu_it_standard"
     end
   end
 

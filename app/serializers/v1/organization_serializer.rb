@@ -6,6 +6,7 @@ module V1
       payload = {
         lago_id: model.id,
         name: model.name,
+        slug: model.slug,
         default_currency: model.default_currency,
         created_at: model.created_at.iso8601,
         webhook_url: webhook_urls.first.to_s,
@@ -26,7 +27,8 @@ module V1
         document_number_prefix: model.document_number_prefix,
         tax_identification_number: model.tax_identification_number,
         finalize_zero_amount_invoice: model.finalize_zero_amount_invoice,
-        billing_configuration:
+        billing_configuration:,
+        events_store: model.events_store
       }
 
       payload = payload.merge(taxes) if include?(:taxes)

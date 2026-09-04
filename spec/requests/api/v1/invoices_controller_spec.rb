@@ -117,6 +117,90 @@ RSpec.describe Api::V1::InvoicesController do
         expect(response).to have_http_status(:success)
       end
     end
+
+    context "with a purchase_order_number" do
+      let(:create_params) do
+        {
+          external_customer_id: customer_external_id,
+          currency: "EUR",
+          purchase_order_number: "  PO-12345  ",
+          fees: [
+            {
+              add_on_code: add_on_first.code,
+              unit_amount_cents: 1200,
+              units: 2
+            }
+          ]
+        }
+      end
+
+      it "creates an invoice with the normalized purchase order number" do
+        subject
+
+        expect(response).to have_http_status(:success)
+        expect(json[:invoice][:purchase_order_number]).to eq("PO-12345")
+      end
+    end
+
+    context "when multi_entity_billing feature flag is enabled" do
+      let(:other_billing_entity) { create(:billing_entity, organization:) }
+
+      before do
+        create(:tax, :applied_to_billing_entity, billing_entity: other_billing_entity, organization:, rate: 20)
+      end
+
+      context "with a known billing_entity_code" do
+        let(:create_params) do
+          {
+            external_customer_id: customer_external_id,
+            currency: "EUR",
+            billing_entity_code: other_billing_entity.code,
+            fees: [{add_on_code: add_on_first.code, unit_amount_cents: 1200, units: 2}]
+          }
+        end
+
+        it "stamps the invoice with the resolved billing entity" do
+          subject
+
+          expect(response).to have_http_status(:success)
+          expect(json[:invoice][:billing_entity_code]).to eq(other_billing_entity.code)
+        end
+      end
+
+      context "with an unknown billing_entity_code" do
+        let(:create_params) do
+          {
+            external_customer_id: customer_external_id,
+            currency: "EUR",
+            billing_entity_code: "unknown_code",
+            fees: [{add_on_code: add_on_first.code, unit_amount_cents: 1200, units: 2}]
+          }
+        end
+
+        it "returns a not found error" do
+          subject
+
+          expect(response).to be_not_found_error("billing_entity")
+        end
+      end
+
+      context "without billing_entity_code" do
+        let(:create_params) do
+          {
+            external_customer_id: customer_external_id,
+            currency: "EUR",
+            fees: [{add_on_code: add_on_first.code, unit_amount_cents: 1200, units: 2}]
+          }
+        end
+
+        it "stamps the invoice with the customer's billing entity" do
+          subject
+
+          expect(response).to have_http_status(:success)
+          expect(json[:invoice][:billing_entity_code]).to eq(customer.billing_entity.code)
+        end
+      end
+    end
   end
 
   describe "PUT /api/v1/invoices/:id" do
@@ -148,6 +232,17 @@ RSpec.describe Api::V1::InvoicesController do
         subject
 
         expect(response).to have_http_status(:not_found)
+      end
+    end
+
+    context "when invoice is voided" do
+      let(:invoice) { create(:invoice, :voided, customer:, organization:) }
+
+      it "returns a method not allowed error and does not update the invoice" do
+        expect { subject }.not_to change { invoice.reload.payment_status }
+
+        expect(response).to have_http_status(:method_not_allowed)
+        expect(json[:code]).to eq("update_on_voided_invoice")
       end
     end
 
@@ -329,6 +424,56 @@ RSpec.describe Api::V1::InvoicesController do
             end
           end
         end
+      end
+    end
+
+    context "with N+1 query detection on customer associations", bullet: {n_plus_one_query: true, unused_eager_loading: false} do
+      let(:other_billing_entity) { create(:billing_entity, organization:) }
+
+      before do
+        [customer.billing_entity, other_billing_entity].each do |billing_entity|
+          invoice_customer = create(
+            :customer,
+            organization:,
+            billing_entity:,
+            payment_provider: "stripe",
+            payment_provider_code: "stripe_code"
+          )
+          create(:stripe_customer, customer: invoice_customer)
+          create(:netsuite_customer, customer: invoice_customer)
+          create(:hubspot_customer, customer: invoice_customer)
+          create(:customer_metadata, customer: invoice_customer, organization:)
+
+          create(:invoice, customer: invoice_customer, organization:, billing_entity:)
+        end
+      end
+
+      it "does not trigger N+1 queries on customer and nested associations" do
+        get_with_token(organization, "/api/v1/invoices", {})
+
+        expect(response).to have_http_status(:success)
+        expect(json[:invoices].count).to eq(2)
+        json[:invoices].each do |invoice|
+          expect(invoice[:customer][:billing_configuration][:provider_customer_id]).to be_present
+          expect(invoice[:customer][:integration_customers]).to be_present
+          expect(invoice[:customer][:metadata]).to be_present
+        end
+      end
+    end
+
+    context "when the result set exceeds the graphql cap" do
+      before do
+        stub_const("BaseQuery::CappedTotalCount::MAX_COUNTED_RECORDS", 1)
+        create(:invoice, customer:, organization:)
+        create(:invoice, customer:, organization:)
+      end
+
+      it "still returns the exact total count" do
+        get_with_token(organization, "/api/v1/invoices", page: 1, per_page: 1)
+
+        expect(response).to have_http_status(:success)
+        expect(json[:meta][:total_count]).to eq(2)
+        expect(json[:meta]).not_to have_key(:total_count_capped)
       end
     end
 
@@ -540,6 +685,70 @@ RSpec.describe Api::V1::InvoicesController do
     end
   end
 
+  describe "DELETE /api/v1/invoices/:id" do
+    subject { delete_with_token(organization, "/api/v1/invoices/#{invoice_id}") }
+
+    let(:invoice) { create(:invoice, status:, customer:, organization:) }
+    let(:invoice_id) { invoice.id }
+    let(:status) { :draft }
+
+    before { invoice }
+
+    include_examples "requires API permission", "invoice", "write"
+
+    context "when the invoice is a draft" do
+      it "marks the invoice as deleted" do
+        expect { subject }.to change { invoice.reload.status }.from("draft").to("deleted")
+      end
+
+      it "returns the deleted invoice" do
+        subject
+
+        expect(response).to have_http_status(:success)
+        expect(json[:invoice][:lago_id]).to eq(invoice.id)
+        expect(json[:invoice][:status]).to eq("deleted")
+      end
+    end
+
+    context "when the invoice does not exist" do
+      let(:invoice_id) { SecureRandom.uuid }
+
+      it "returns a not found error" do
+        subject
+        expect(response).to have_http_status(:not_found)
+      end
+    end
+
+    context "when the invoice is not a draft" do
+      let(:status) { :finalized }
+
+      it "returns a method not allowed error" do
+        subject
+
+        expect(response).to have_http_status(:method_not_allowed)
+        expect(json[:code]).to eq("not_deletable")
+      end
+    end
+
+    context "when the invoice is already deleted" do
+      let(:status) { :deleted }
+
+      it "returns a not found error" do
+        subject
+        expect(response).to have_http_status(:not_found)
+      end
+    end
+
+    context "when invoices belongs to another organization" do
+      let(:invoice) { create(:invoice, status: :draft) }
+
+      it "returns not found" do
+        subject
+        expect(response).to have_http_status(:not_found)
+      end
+    end
+  end
+
   describe "POST /api/v1/invoices/:id/lose_dispute" do
     subject { post_with_token(organization, "/api/v1/invoices/#{invoice_id}/lose_dispute") }
 
@@ -623,21 +832,15 @@ RSpec.describe Api::V1::InvoicesController do
 
       context "with /#{route}" do
         context "without generated pdf" do
-          before do
-            allow(Invoices::GeneratePdfJob).to receive(:perform_later)
-          end
-
           it "calls generate pdf async" do
             subject
 
-            expect(Invoices::GeneratePdfJob).to have_received(:perform_later)
+            expect(Invoices::GeneratePdfJob).to have_been_enqueued
           end
         end
 
         context "when generated pdf" do
           before do
-            allow(Invoices::GeneratePdfJob).to receive(:perform_later)
-
             invoice.file.attach(
               io: StringIO.new(File.read(Rails.root.join("spec/fixtures/blank.pdf"))),
               filename: "invoice.pdf",
@@ -648,7 +851,7 @@ RSpec.describe Api::V1::InvoicesController do
           it "does not regenerate" do
             subject
 
-            expect(Invoices::GeneratePdfJob).not_to have_received(:perform_later)
+            expect(Invoices::GeneratePdfJob).not_to have_been_enqueued
           end
         end
 
@@ -674,21 +877,15 @@ RSpec.describe Api::V1::InvoicesController do
     include_examples "requires API permission", "invoice", "write"
 
     context "without generated pdf" do
-      before do
-        allow(Invoices::GenerateXmlJob).to receive(:perform_later)
-      end
-
       it "calls generate pdf async" do
         subject
 
-        expect(Invoices::GenerateXmlJob).to have_received(:perform_later)
+        expect(Invoices::GenerateXmlJob).to have_been_enqueued
       end
     end
 
     context "with generated pdf" do
       before do
-        allow(Invoices::GenerateXmlJob).to receive(:perform_later)
-
         invoice.xml_file.attach(
           io: StringIO.new(File.read(Rails.root.join("spec/fixtures/blank.xml"))),
           filename: "invoice.xml",
@@ -699,7 +896,7 @@ RSpec.describe Api::V1::InvoicesController do
       it "does not regenerate" do
         subject
 
-        expect(Invoices::GenerateXmlJob).not_to have_received(:perform_later)
+        expect(Invoices::GenerateXmlJob).not_to have_been_enqueued
       end
     end
 
@@ -723,7 +920,7 @@ RSpec.describe Api::V1::InvoicesController do
 
     before do
       allow(Invoices::Payments::RetryService).to receive(:new).and_return(retry_service)
-      allow(retry_service).to receive(:call).and_return(BaseService::Result.new)
+      allow(retry_service).to receive(:call).and_return(Invoices::Payments::RetryService::Result.new)
     end
 
     include_examples "requires API permission", "invoice", "write"
@@ -747,10 +944,8 @@ RSpec.describe Api::V1::InvoicesController do
       it "calls retry service" do
         subject
 
-        aggregate_failures do
-          expect(response).to have_http_status(:success)
-          expect(retry_service).to have_received(:call)
-        end
+        expect(response).to have_http_status(:success)
+        expect(retry_service).to have_received(:call)
       end
     end
 
@@ -780,7 +975,7 @@ RSpec.describe Api::V1::InvoicesController do
     let!(:invoice) { create(:invoice, customer:, organization:) }
     let(:invoice_id) { invoice.id }
     let(:retry_service) { instance_double(Invoices::RetryService) }
-    let(:result) { BaseService::Result.new }
+    let(:result) { Invoices::RetryService::Result.new }
 
     before do
       result.invoice = invoice
@@ -823,7 +1018,7 @@ RSpec.describe Api::V1::InvoicesController do
 
     let!(:invoice) { create(:invoice, customer:, organization:) }
     let(:invoice_id) { invoice.id }
-    let(:result) { BaseService::Result.new }
+    let(:result) { Invoices::SyncSalesforceIdService::Result.new }
 
     before do
       result.invoice = invoice
@@ -1025,6 +1220,53 @@ RSpec.describe Api::V1::InvoicesController do
           subject
 
           expect(response).to have_http_status(:not_found)
+        end
+      end
+
+      context "when previewing a new subscription for an existing customer with multi_entity_billing enabled" do
+        let(:existing_customer) { create(:customer, organization:, currency: "EUR") }
+        let(:preview_params) do
+          {
+            customer: {external_id: existing_customer.external_id},
+            plan_code: plan.code,
+            billing_time: "anniversary",
+            billing_entity_code: billing_entity.code
+          }
+        end
+
+        it "creates a preview invoice under the requested billing entity" do
+          subject
+
+          expect(response).to have_http_status(:success)
+          expect(json[:invoice]).to include(
+            billing_entity_code: billing_entity.code,
+            invoice_type: "subscription"
+          )
+        end
+      end
+
+      context "when previewing for an anonymous customer with multi_entity_billing enabled" do
+        let(:preview_params) do
+          {
+            customer: {
+              name: "test 1",
+              currency: "EUR",
+              tax_identification_number: "123456789"
+            },
+            plan_code: plan.code,
+            billing_time: "anniversary",
+            billing_entity_code: billing_entity.code
+          }
+        end
+
+        it "stamps the invoice with the requested billing entity" do
+          subject
+
+          expect(response).to have_http_status(:success)
+          expect(json[:invoice]).to include(
+            billing_entity_code: billing_entity.code,
+            invoice_type: "subscription"
+          )
         end
       end
     end
@@ -1309,6 +1551,152 @@ RSpec.describe Api::V1::InvoicesController do
               total_amount_cents: 120
             )
           end
+        end
+      end
+    end
+
+    context "with a scheduled downgrade (projection)" do
+      let(:customer) { create(:customer, organization:, external_id: "downgrade_customer") }
+      let(:current_plan) do
+        create(:plan, organization:, interval: "monthly", pay_in_advance: true, amount_cents: 1000)
+      end
+      let(:next_plan) do
+        create(:plan, organization:, interval: "monthly", pay_in_advance: true, amount_cents: 500)
+      end
+      let(:subscription) do
+        create(
+          :subscription,
+          customer:,
+          plan: current_plan,
+          status: :active,
+          billing_time: "anniversary",
+          subscription_at: Time.zone.parse("2026-03-03"),
+          started_at: Time.zone.parse("2026-03-03")
+        )
+      end
+      let(:next_subscription) do
+        create(
+          :subscription,
+          :pending,
+          customer:,
+          plan: next_plan,
+          billing_time: "anniversary",
+          previous_subscription: subscription,
+          subscription_at: Time.zone.parse("2026-07-03")
+        )
+      end
+      let(:preview_params) do
+        {
+          customer: {external_id: customer.external_id},
+          subscriptions: {external_ids: [subscription.external_id]}
+        }
+      end
+
+      before { next_subscription }
+
+      it "serializes the pending plan's real first billing period" do
+        travel_to(Time.zone.parse("2026-06-04T10:00:00Z")) do
+          subject
+
+          expect(response).to have_http_status(:success)
+
+          subscriptions = json[:invoice][:subscriptions]
+          expect(subscriptions.size).to eq(2)
+
+          pending_plan = subscriptions.find { |s| s[:plan_code] == next_plan.code }
+          expect(pending_plan).to be_present
+          expect(pending_plan[:started_at]).to eq("2026-07-03T00:00:00.000Z")
+          expect(pending_plan[:current_billing_period_started_at]).to eq("2026-07-03T00:00:00Z")
+          expect(pending_plan[:current_billing_period_ending_at]).to eq("2026-08-02T23:59:59Z")
+          expect(pending_plan[:current_billing_period_started_at])
+            .not_to eq(pending_plan[:current_billing_period_ending_at])
+        end
+      end
+    end
+
+    context "with a not-yet-scheduled downgrade (plan_code)" do
+      let(:customer) { create(:customer, organization:, external_id: "plan_change_customer") }
+      let(:current_plan) do
+        create(:plan, organization:, interval: "monthly", pay_in_advance: true, amount_cents: 1000)
+      end
+      let(:target_plan) do
+        create(:plan, organization:, interval: "monthly", pay_in_advance: true, amount_cents: 500)
+      end
+      let(:subscription) do
+        create(
+          :subscription,
+          customer:,
+          plan: current_plan,
+          status: :active,
+          billing_time: "anniversary",
+          subscription_at: Time.zone.parse("2026-03-03"),
+          started_at: Time.zone.parse("2026-03-03")
+        )
+      end
+      let(:preview_params) do
+        {
+          customer: {external_id: customer.external_id},
+          subscriptions: {external_ids: [subscription.external_id], plan_code: target_plan.code}
+        }
+      end
+
+      before { subscription }
+
+      it "serializes the target plan's real first billing period" do
+        travel_to(Time.zone.parse("2026-06-04T10:00:00Z")) do
+          subject
+
+          expect(response).to have_http_status(:success)
+
+          pending_plan = json[:invoice][:subscriptions].find { |s| s[:plan_code] == target_plan.code }
+          expect(pending_plan).to be_present
+          expect(pending_plan[:started_at]).to eq("2026-07-03T00:00:00.000Z")
+          expect(pending_plan[:current_billing_period_started_at]).to eq("2026-07-03T00:00:00Z")
+          expect(pending_plan[:current_billing_period_ending_at]).to eq("2026-08-02T23:59:59Z")
+          expect(pending_plan[:current_billing_period_started_at])
+            .not_to eq(pending_plan[:current_billing_period_ending_at])
+        end
+      end
+    end
+
+    context "when subscription has a minimum commitment and terminated_at is provided" do
+      let(:timestamp) { Time.zone.parse("2026-01-15") }
+      let(:commitment_customer) { create(:customer, organization:, external_id: "commitment_customer") }
+      let(:commitment_plan) do
+        create(:plan, organization:, interval: "yearly", pay_in_advance: false, amount_cents: 100_00)
+      end
+      let(:subscription) do
+        create(
+          :subscription,
+          customer: commitment_customer,
+          plan: commitment_plan,
+          billing_time: "calendar",
+          started_at: Time.zone.parse("2026-01-01"),
+          subscription_at: Time.zone.parse("2026-01-01")
+        )
+      end
+      let(:preview_params) do
+        {
+          customer: {external_id: commitment_customer.external_id},
+          subscriptions: {
+            external_ids: [subscription.external_id],
+            terminated_at: "2026-07-01T00:00:00Z"
+          }
+        }
+      end
+
+      before do
+        create(:commitment, :minimum_commitment, plan: commitment_plan, amount_cents: 1_000_00)
+      end
+
+      it "creates a preview invoice with a commitment true-up fee" do
+        travel_to(timestamp) do
+          subject
+
+          expect(response).to have_http_status(:success)
+          expect(json[:invoice][:fees]).to include(
+            hash_including(item: hash_including(type: "commitment"))
+          )
         end
       end
     end

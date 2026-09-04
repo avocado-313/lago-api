@@ -22,7 +22,14 @@ RSpec.describe Types::ActivityLogs::ResourceObject do
       Types::Coupons::Object,
       Types::PaymentRequests::Object,
       Types::Entitlement::FeatureObject,
-      Types::PaymentReceipts::Object
+      Types::PaymentReceipts::Object,
+      Types::ProductCategories::Object,
+      Types::Products::Object,
+      Types::ProductFilters::Object,
+      Types::RateCards::Object,
+      Types::Quotes::Object,
+      Types::OrderForms::Object,
+      Types::Orders::Object
     )
   end
 
@@ -38,6 +45,13 @@ RSpec.describe Types::ActivityLogs::ResourceObject do
     let(:coupon) { create(:coupon) }
     let(:payment_request) { create(:payment_request) }
     let(:feature) { create(:feature) }
+    let(:product_category) { create(:product_category) }
+    let(:product) { create(:product) }
+    let(:product_filter) { create(:product_filter) }
+    let(:rate_card) { create(:rate_card) }
+    let(:quote) { create(:quote) }
+    let(:order_form) { create(:order_form) }
+    let(:order) { create(:order) }
 
     it "returns Types::BillableMetrics::Object for BillableMetric objects" do
       expect(subject.resolve_type(billable_metric, {})).to eq(Types::BillableMetrics::Object)
@@ -85,6 +99,34 @@ RSpec.describe Types::ActivityLogs::ResourceObject do
 
     it "returns Types::Entitlement::FeatureObject for Feature objects" do
       expect(subject.resolve_type(feature, {})).to eq(Types::Entitlement::FeatureObject)
+    end
+
+    it "returns Types::ProductCategories::Object for ProductCategory objects" do
+      expect(subject.resolve_type(product_category, {})).to eq(Types::ProductCategories::Object)
+    end
+
+    it "returns Types::Products::Object for Product objects" do
+      expect(subject.resolve_type(product, {})).to eq(Types::Products::Object)
+    end
+
+    it "returns Types::ProductFilters::Object for ProductFilter objects" do
+      expect(subject.resolve_type(product_filter, {})).to eq(Types::ProductFilters::Object)
+    end
+
+    it "returns Types::RateCards::Object for RateCard objects" do
+      expect(subject.resolve_type(rate_card, {})).to eq(Types::RateCards::Object)
+    end
+
+    it "returns Types::Quotes::Object for Quote objects" do
+      expect(subject.resolve_type(quote, {})).to eq(Types::Quotes::Object)
+    end
+
+    it "returns Types::OrderForms::Object for OrderForm objects" do
+      expect(subject.resolve_type(order_form, {})).to eq(Types::OrderForms::Object)
+    end
+
+    it "returns Types::Orders::Object for Order objects" do
+      expect(subject.resolve_type(order, {})).to eq(Types::Orders::Object)
     end
   end
 end

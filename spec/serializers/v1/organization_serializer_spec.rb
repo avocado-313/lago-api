@@ -17,6 +17,7 @@ RSpec.describe ::V1::OrganizationSerializer do
     result = JSON.parse(serializer.to_json)
 
     expect(result["organization"]["name"]).to eq(org.name)
+    expect(result["organization"]["slug"]).to eq(org.slug)
     expect(result["organization"]["default_currency"]).to eq(org.default_currency)
     expect(result["organization"]["created_at"]).to eq(org.created_at.iso8601)
     expect(result["organization"]["webhook_url"]).to eq(webhook_urls.first)
@@ -38,5 +39,6 @@ RSpec.describe ::V1::OrganizationSerializer do
     expect(result["organization"]["net_payment_term"]).to eq(org.net_payment_term)
     expect(result["organization"]["finalize_zero_amount_invoice"]).to eq(org.finalize_zero_amount_invoice)
     expect(result["organization"]["taxes"].count).to eq(1)
+    expect(result["organization"]["events_store"]).to eq(org.events_store)
   end
 end

@@ -2,6 +2,8 @@
 
 module Invoices
   class FinalizeService < BaseService
+    Result = BaseResult[:invoice]
+
     def initialize(invoice:)
       @invoice = invoice
       super
@@ -15,10 +17,9 @@ module Invoices
         return result
       end
 
-      ActiveRecord::Base.transaction do
-        invoice.status = :finalized
-        invoice.save!
-      end
+      invoice.finalized!
+
+      Invoices::RefreshSearchTermsService.call!(invoice:)
 
       result.invoice = invoice
       result

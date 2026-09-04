@@ -44,7 +44,6 @@ RSpec.describe Invoices::SubscriptionService do
       create(:standard_charge, plan: subscription.plan, charge_model: "standard")
       lifetime_usage
 
-      allow(SegmentTrackJob).to receive(:perform_later)
       allow(Invoices::Payments::CreateService).to receive(:call_async).and_call_original
       allow(Invoices::TransitionToFinalStatusService).to receive(:call).and_call_original
     end
@@ -52,7 +51,7 @@ RSpec.describe Invoices::SubscriptionService do
     it "calls SegmentTrackJob" do
       invoice = invoice_service.call.invoice
 
-      expect(SegmentTrackJob).to have_received(:perform_later).with(
+      expect(SegmentTrackJob).to have_been_enqueued.with(
         membership_id: CurrentContext.membership,
         event: "invoice_created",
         properties: {
@@ -101,12 +100,284 @@ RSpec.describe Invoices::SubscriptionService do
       expect(result.invoice).to be_finalized
     end
 
+    context "when the subscription has its own billing_entity" do
+      let(:subscription_billing_entity) { create(:billing_entity, organization:) }
+      let(:subscription) do
+        create(
+          :subscription,
+          plan:,
+          customer:,
+          billing_entity: subscription_billing_entity,
+          subscription_at: started_at.to_date,
+          started_at:,
+          created_at: started_at
+        )
+      end
+
+      it "stamps the generated invoice with the subscription's entity" do
+        result = invoice_service.call
+
+        expect(result).to be_success
+        expect(result.invoice.billing_entity_id).to eq(subscription_billing_entity.id)
+      end
+
+      it "stamps generated fees with the subscription's entity" do
+        result = invoice_service.call
+
+        expect(result.invoice.fees.subscription.first.billing_entity_id).to eq(subscription_billing_entity.id)
+      end
+    end
+
+    context "when a subscription is moved between billing entities mid-lifecycle" do
+      let(:eu_entity) { create(:billing_entity, organization:) }
+
+      it "stamps the past invoice with the original entity, then the next billing cycle with the new one" do
+        past_invoice = described_class.call(
+          subscriptions:,
+          timestamp: (timestamp - 1.month).to_i,
+          invoicing_reason: :subscription_periodic
+        ).invoice
+
+        expect(past_invoice.billing_entity_id).to eq(billing_entity.id)
+
+        update_result = Subscriptions::UpdateService.call(
+          subscription:,
+          params: {billing_entity_code: eu_entity.code}
+        )
+        expect(update_result).to be_success
+        expect(subscription.reload.billing_entity_id).to eq(eu_entity.id)
+
+        new_invoice = described_class.call(
+          subscriptions: [subscription],
+          timestamp: timestamp.to_i,
+          invoicing_reason: :subscription_periodic
+        ).invoice
+
+        expect(new_invoice.billing_entity_id).to eq(eu_entity.id)
+        expect(new_invoice.fees.subscription.first.billing_entity_id).to eq(eu_entity.id)
+        expect(past_invoice.reload.billing_entity_id).to eq(billing_entity.id)
+      end
+    end
+
+    context "when batched subscriptions resolve to different billing entities" do
+      let(:other_entity) { create(:billing_entity, organization:) }
+      let(:other_subscription) do
+        create(
+          :subscription,
+          plan:,
+          customer:,
+          billing_entity: other_entity,
+          subscription_at: started_at.to_date,
+          started_at:,
+          created_at: started_at
+        )
+      end
+      let(:subscriptions) { [subscription, other_subscription] }
+
+      it "returns a validation failure rather than producing a mixed-entity invoice" do
+        result = invoice_service.call
+
+        expect(result).not_to be_success
+        expect(result.error).to be_a(BaseService::ValidationFailure)
+        expect(result.error.messages[:billing_entity]).to eq(["mixed_billing_entities"])
+      end
+    end
+
+    context "when batched subscriptions carry different purchase order numbers" do
+      let(:other_subscription) do
+        create(
+          :subscription,
+          plan:,
+          customer:,
+          subscription_at: started_at.to_date,
+          started_at:,
+          created_at: started_at,
+          purchase_order_number: "PO-2"
+        )
+      end
+      let(:subscription) do
+        create(
+          :subscription,
+          plan:,
+          customer:,
+          subscription_at: started_at.to_date,
+          started_at:,
+          created_at: started_at,
+          purchase_order_number: "PO-1"
+        )
+      end
+      let(:subscriptions) { [subscription, other_subscription] }
+
+      it "returns a validation failure rather than producing a mixed-PO invoice" do
+        result = invoice_service.call
+
+        expect(result).not_to be_success
+        expect(result.error).to be_a(BaseService::ValidationFailure)
+        expect(result.error.messages[:purchase_order_number]).to eq(["mixed_purchase_order_numbers"])
+      end
+    end
+
+    context "when the subscription has a purchase_order_number" do
+      let(:subscription) do
+        create(
+          :subscription,
+          plan:,
+          customer:,
+          subscription_at: started_at.to_date,
+          started_at:,
+          created_at: started_at,
+          purchase_order_number: "PO-123"
+        )
+      end
+
+      it "stamps the purchase_order_number on the invoice" do
+        invoice = invoice_service.call.invoice
+
+        expect(invoice.purchase_order_number).to eq("PO-123")
+      end
+    end
+
+    context "when multiple subscriptions share the same purchase_order_number" do
+      let(:other_subscription) do
+        create(
+          :subscription,
+          plan:,
+          customer:,
+          subscription_at: started_at.to_date,
+          started_at:,
+          created_at: started_at,
+          purchase_order_number: "PO-1"
+        )
+      end
+      let(:subscription) do
+        create(
+          :subscription,
+          plan:,
+          customer:,
+          subscription_at: started_at.to_date,
+          started_at:,
+          created_at: started_at,
+          purchase_order_number: "PO-1"
+        )
+      end
+      let(:subscriptions) { [subscription, other_subscription] }
+
+      it "stamps the shared purchase_order_number on the single invoice" do
+        result = invoice_service.call
+
+        expect(result).to be_success
+        expect(result.invoice.purchase_order_number).to eq("PO-1")
+      end
+    end
+
+    context "when the subscription has no purchase_order_number" do
+      it "leaves the invoice purchase_order_number nil" do
+        invoice = invoice_service.call.invoice
+
+        expect(invoice.purchase_order_number).to be_nil
+      end
+    end
+
+    context "when retrying an existing generating invoice" do
+      let(:subscription) do
+        create(
+          :subscription,
+          plan:,
+          customer:,
+          subscription_at: started_at.to_date,
+          started_at:,
+          created_at: started_at,
+          purchase_order_number: "PO-CURRENT"
+        )
+      end
+
+      let(:existing_invoice) do
+        create(
+          :invoice,
+          customer:,
+          organization:,
+          invoice_type: :subscription,
+          status: :generating,
+          purchase_order_number: "PO-STAMPED"
+        )
+      end
+
+      before do
+        create(:invoice_subscription, invoice: existing_invoice, subscription:, timestamp:)
+      end
+
+      it "preserves the stamped purchase_order_number instead of re-resolving from the subscription" do
+        described_class.new(
+          subscriptions:,
+          timestamp: timestamp.to_i,
+          invoicing_reason:,
+          invoice: existing_invoice
+        ).call
+
+        expect(existing_invoice.reload.purchase_order_number).to eq("PO-STAMPED")
+      end
+    end
+
     it_behaves_like "syncs invoice" do
       let(:service_call) { invoice_service.call }
     end
 
     it_behaves_like "applies invoice_custom_sections" do
       let(:service_call) { invoice_service.call }
+    end
+
+    it_behaves_like "applies invoice_custom_sections from resource" do
+      let(:service_call) { invoice_service.call }
+      let(:resource_with_custom_section) { subscription }
+      let(:applied_section_factory) { :subscription_applied_invoice_custom_section }
+      let(:resource_association_key) { :subscription }
+    end
+
+    context "with multiple subscriptions" do
+      let(:subscription_2) { create(:subscription, plan:, customer:, subscription_at: started_at.to_date, started_at:, created_at: started_at) }
+      let(:subscriptions) { [subscription, subscription_2] }
+      let(:section_1) { create(:invoice_custom_section, organization:) }
+      let(:section_2) { create(:invoice_custom_section, organization:) }
+
+      before do
+        create(:billing_entity_applied_invoice_custom_section, organization:, billing_entity:, invoice_custom_section: create(:invoice_custom_section, organization:))
+      end
+
+      context "when all subscriptions have ICS configured" do
+        before do
+          create(:subscription_applied_invoice_custom_section, organization:, subscription:, invoice_custom_section: section_1)
+          create(:subscription_applied_invoice_custom_section, organization:, subscription: subscription_2, invoice_custom_section: section_2)
+        end
+
+        it "applies the union of all subscriptions' sections, ignoring billing entity sections" do
+          result = invoice_service.call
+          expect(result.invoice.applied_invoice_custom_sections.pluck(:code)).to match_array([section_1.code, section_2.code])
+        end
+      end
+
+      context "when only some subscriptions have ICS configured" do
+        let(:customer_section) { create(:invoice_custom_section, organization:) }
+
+        before do
+          create(:subscription_applied_invoice_custom_section, organization:, subscription:, invoice_custom_section: section_1)
+          create(:customer_applied_invoice_custom_section, organization:, billing_entity:, customer:, invoice_custom_section: customer_section)
+        end
+
+        it "merges sections from configured subscriptions with customer sections" do
+          result = invoice_service.call
+          expect(result.invoice.applied_invoice_custom_sections.pluck(:code)).to match_array([section_1.code, customer_section.code])
+        end
+      end
+
+      context "when all subscriptions have skip_invoice_custom_sections" do
+        let(:subscription) { create(:subscription, plan:, customer:, subscription_at: started_at.to_date, started_at:, created_at: started_at, skip_invoice_custom_sections: true) }
+        let(:subscription_2) { create(:subscription, plan:, customer:, subscription_at: started_at.to_date, started_at:, created_at: started_at, skip_invoice_custom_sections: true) }
+
+        it "does not apply any sections" do
+          result = invoice_service.call
+          expect(result.invoice.applied_invoice_custom_sections).to be_empty
+        end
+      end
     end
 
     it "enqueues a SendWebhookJob" do
@@ -119,6 +390,26 @@ RSpec.describe Invoices::SubscriptionService do
       invoice = described_class.call(subscriptions:, timestamp: timestamp.to_i, invoicing_reason:).invoice
 
       expect(Utils::ActivityLog).to have_produced("invoice.created").after_commit.with(invoice)
+    end
+
+    context "with billingentity resolution" do
+      it "stamps the customer's billing_entity when subscription has none" do
+        invoice = invoice_service.call.invoice
+
+        expect(invoice.billing_entity).to eq(customer.billing_entity)
+      end
+
+      context "when subscription has its own billing_entity" do
+        let(:other_billing_entity) { create(:billing_entity, organization:) }
+
+        before { subscription.update!(billing_entity: other_billing_entity) }
+
+        it "stamps the subscription's billing_entity on the invoice" do
+          invoice = invoice_service.call.invoice
+
+          expect(invoice.billing_entity).to eq(other_billing_entity)
+        end
+      end
     end
 
     it "enqueues GenerateDocumentsJob with email false" do
@@ -266,7 +557,7 @@ RSpec.describe Invoices::SubscriptionService do
 
       it "does not track any invoice creation on segment" do
         invoice_service.call
-        expect(SegmentTrackJob).not_to have_received(:perform_later)
+        expect(SegmentTrackJob).not_to have_been_enqueued
       end
 
       it "does not create any payment" do
@@ -292,6 +583,18 @@ RSpec.describe Invoices::SubscriptionService do
         expect(Utils::ActivityLog).to have_produced("invoice.drafted").after_commit.with(invoice)
       end
 
+      it "enqueues a SendWebhookJob for invoice.ready_to_finalize" do
+        expect do
+          invoice_service.call
+        end.to have_enqueued_job_after_commit(SendWebhookJob).with("invoice.ready_to_finalize", Invoice)
+      end
+
+      it "produces an activity log for invoice.ready_to_finalize" do
+        invoice = described_class.call(subscriptions:, timestamp: timestamp.to_i, invoicing_reason:).invoice
+
+        expect(Utils::ActivityLog).to have_produced("invoice.ready_to_finalize").after_commit.with(invoice)
+      end
+
       it "does not flag lifetime usage for refresh" do
         invoice_service.call
 
@@ -311,6 +614,39 @@ RSpec.describe Invoices::SubscriptionService do
           result = invoice_service.call
           expect(result).to be_success
           expect(result.invoice).to be_draft
+        end
+      end
+
+      context "when the invoice ends with pending taxes" do
+        let(:integration) { create(:anrok_integration, organization:) }
+        let(:integration_customer) { create(:anrok_customer, integration:, customer:) }
+
+        before { integration_customer }
+
+        it "creates a draft invoice with tax_status pending" do
+          result = invoice_service.call
+
+          expect(result).to be_success
+          expect(result.invoice).to be_draft
+          expect(result.invoice).to be_tax_pending
+        end
+
+        it "enqueues a SendWebhookJob for invoice.drafted" do
+          expect do
+            invoice_service.call
+          end.to have_enqueued_job_after_commit(SendWebhookJob).with("invoice.drafted", Invoice)
+        end
+
+        it "does not enqueue a SendWebhookJob for invoice.ready_to_finalize" do
+          expect do
+            invoice_service.call
+          end.not_to have_enqueued_job(SendWebhookJob).with("invoice.ready_to_finalize", Invoice)
+        end
+
+        it "does not produce an activity log for invoice.ready_to_finalize" do
+          invoice_service.call
+
+          expect(Utils::ActivityLog).not_to have_produced("invoice.ready_to_finalize")
         end
       end
     end
@@ -413,7 +749,7 @@ RSpec.describe Invoices::SubscriptionService do
       let(:customer) { create(:customer, :with_salesforce_integration, :with_hubspot_integration, organization:, account_type: "partner") }
       let(:salesforce_service) { instance_double(Integrations::Aggregator::Invoices::CreateService) }
       let(:hubspot_service) { instance_double(Integrations::Aggregator::Invoices::Hubspot::CreateService) }
-      let(:result) { BaseService::Result.new }
+      let(:result) { Integrations::Aggregator::Invoices::CreateService::Result.new }
 
       before do
         allow(Integrations::Aggregator::Invoices::CreateService).to receive(:new).and_return(salesforce_service)
@@ -573,6 +909,87 @@ RSpec.describe Invoices::SubscriptionService do
       end
     end
 
+    context "when subscription is gated" do
+      let(:invoicing_reason) { :subscription_starting }
+      let(:pay_in_advance) { true }
+      let(:subscription) do
+        create(:subscription, :incomplete, :with_activation_rules,
+          activation_rules_config: [{type: "payment", timeout_hours: 48, status: "pending"}],
+          plan:, customer:, organization: customer.organization,
+          subscription_at: started_at.to_date, started_at:, created_at: started_at)
+      end
+
+      it "creates an open invoice" do
+        result = invoice_service.call
+
+        expect(result).to be_success
+        expect(result.invoice).to be_open
+      end
+
+      it "skips grace period" do
+        result = invoice_service.call
+
+        expect(result.invoice.issuing_date.to_s).to eq(Time.zone.at(timestamp).to_date.to_s)
+      end
+
+      it "does not send invoice.created webhook" do
+        invoice_service.call
+
+        expect(SendWebhookJob).not_to have_been_enqueued.with("invoice.created", anything)
+      end
+
+      it "does not generate documents" do
+        invoice_service.call
+
+        expect(Invoices::GenerateDocumentsJob).not_to have_been_enqueued
+      end
+
+      it "triggers payment" do
+        invoice_service.call
+
+        expect(Invoices::Payments::CreateService).to have_received(:call_async)
+      end
+
+      context "when invoice total is zero" do
+        let(:plan) { create(:plan, interval: "monthly", pay_in_advance: true, amount_cents: 0) }
+        let(:rule) { subscription.activation_rules.payment.sole }
+
+        it "marks the payment activation rule as satisfied" do
+          invoice_service.call
+
+          expect(rule.reload).to be_satisfied
+        end
+
+        it "activates the subscription" do
+          invoice_service.call
+
+          expect(subscription.reload).to be_active
+        end
+      end
+
+      context "when tax is pending" do
+        let(:integration) { create(:anrok_integration, organization:) }
+        let(:integration_customer) { create(:anrok_customer, integration:, customer:) }
+        let(:rule) { subscription.activation_rules.payment.sole }
+
+        before { integration_customer }
+
+        it "does not fire the zero-amount activation shortcut" do
+          invoice_service.call
+
+          expect(rule.reload).to be_pending
+          expect(subscription.reload).to be_incomplete
+        end
+
+        it "keeps the invoice open with tax_status pending" do
+          result = invoice_service.call
+
+          expect(result.invoice).to be_open
+          expect(result.invoice.tax_status).to eq("pending")
+        end
+      end
+    end
+
     context "when an error occurs" do
       context "with a stale object error" do
         it "propagates the error" do
@@ -586,10 +1003,37 @@ RSpec.describe Invoices::SubscriptionService do
       context "with a failed to acquire lock error" do
         it "propagates the error" do
           allow_any_instance_of(Credits::AppliedPrepaidCreditsService) # rubocop:disable RSpec/AnyInstance
-            .to receive(:call).and_raise(Customers::FailedToAcquireLock)
+            .to receive(:call).and_raise(BaseLockService::FailedToAcquireLock)
 
-          expect { invoice_service.call }.to raise_error(Customers::FailedToAcquireLock)
+          expect { invoice_service.call }.to raise_error(BaseLockService::FailedToAcquireLock)
         end
+      end
+    end
+
+    context "when activation billing fails after fees were created" do
+      subject(:invoice_service) do
+        described_class.new(
+          subscriptions:,
+          timestamp: timestamp.to_i,
+          invoicing_reason:,
+          skip_charges: true
+        )
+      end
+
+      let(:invoicing_reason) { :subscription_starting }
+      let(:pay_in_advance) { true }
+
+      before do
+        allow(Invoices::ApplyInvoiceCustomSectionsService)
+          .to receive(:call).and_raise(StandardError.new("boom"))
+      end
+
+      it "rolls the fees back instead of committing them with the lock" do
+        result = nil
+
+        expect { result = invoice_service.call }.not_to change(Fee, :count)
+
+        expect(result).to be_failure
       end
     end
   end

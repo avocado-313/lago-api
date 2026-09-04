@@ -31,6 +31,28 @@ RSpec.describe Invoices::UpdateService do
       )
     end
 
+    context "when the invoice settles with an open checkout session" do
+      before { create(:payment_intent, invoice:) }
+
+      it "enqueues a job to expire the checkout session" do
+        expect { result }.to have_enqueued_job_after_commit(PaymentIntents::ExpireJob).with(invoice)
+      end
+
+      context "when the invoice was already succeeded" do
+        let(:invoice) { create(:invoice, payment_status: :succeeded) }
+
+        it "does not enqueue the expire job" do
+          expect { result }.not_to have_enqueued_job(PaymentIntents::ExpireJob)
+        end
+      end
+    end
+
+    context "when the invoice settles without an open checkout session" do
+      it "does not enqueue the expire job" do
+        expect { result }.not_to have_enqueued_job(PaymentIntents::ExpireJob)
+      end
+    end
+
     context "when invoices is included in a payment request" do
       let(:customer) do
         create(
@@ -62,10 +84,11 @@ RSpec.describe Invoices::UpdateService do
           create(:payment_request, customer:, invoices: [invoice], dunning_campaign:)
         end
 
-        it "resets customer dunning campaign status counters" do
+        it "resets customer dunning campaign status counters for the invoice currency" do
           expect { result && customer.reload }
             .to change(customer, :last_dunning_campaign_attempt).to(0)
             .and change(customer, :last_dunning_campaign_attempt_at).to(nil)
+            .and change(customer, :dunning_currency_attempts).to({"EUR" => 0})
         end
       end
     end
@@ -240,6 +263,38 @@ RSpec.describe Invoices::UpdateService do
 
         it "calls Invoices::PrepaidCreditJob with the correct arguments" do
           expect { result }.to have_enqueued_job_after_commit(Invoices::PrepaidCreditJob).with(invoice, :failed)
+        end
+      end
+    end
+
+    context "when invoice is subscription_gated and payment_status changes" do
+      let(:subscription) do
+        create(:subscription, :incomplete, :with_activation_rules,
+          organization: invoice.organization, customer: invoice.customer, plan:,
+          activation_rules_config: [{type: "payment", timeout_hours: 48, status: "pending"}])
+      end
+      let(:plan) { create(:plan, organization: invoice.organization, pay_in_advance: true) }
+      let(:invoice) { create(:invoice, status: :open, invoice_type: :subscription, payment_overdue: false) }
+
+      before { create(:invoice_subscription, invoice:, subscription:) }
+
+      context "when payment_status is succeeded" do
+        let(:update_args) { {payment_status: "succeeded"} }
+
+        it "enqueues ResolveJob" do
+          expect { invoice_service.call }
+            .to have_enqueued_job_after_commit(Subscriptions::ActivationRules::Payment::ResolveJob)
+            .with(subscription, invoice, :succeeded)
+        end
+      end
+
+      context "when payment_status is failed" do
+        let(:update_args) { {payment_status: "failed"} }
+
+        it "enqueues ResolveJob" do
+          expect { invoice_service.call }
+            .to have_enqueued_job_after_commit(Subscriptions::ActivationRules::Payment::ResolveJob)
+            .with(subscription, invoice, :failed)
         end
       end
     end

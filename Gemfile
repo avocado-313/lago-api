@@ -3,7 +3,7 @@
 source "https://rubygems.org"
 git_source(:github) { |repo| "https://github.com/#{repo}.git" }
 
-ruby "4.0.2"
+ruby "4.0.6"
 
 # Core
 gem "aasm"
@@ -13,7 +13,7 @@ gem "active_storage_validations"
 gem "bootsnap", require: false
 gem "clockwork", require: false
 gem "parallel"
-gem "puma", "~> 6.5"
+gem "puma", "~> 7.2"
 gem "rails", "~> 8.0"
 gem "redis"
 gem "sidekiq"
@@ -28,10 +28,11 @@ gem "sidekiq-throttled", "1.4.0" # '1.5.0' was losing some jobs
 gem "throttling"
 gem "device_detector"
 gem "dry-validation"
+gem "json_schemer"
 
 # Security
 gem "bcrypt"
-gem "googleauth", "~> 1.11.0"
+gem "googleauth", "~> 1.17.0"
 gem "jwt"
 gem "oauth2"
 gem "rack-cors"
@@ -39,7 +40,7 @@ gem "rack-cors"
 # Database
 gem "after_commit_everywhere"
 gem "clickhouse-activerecord", "~> 1.6.1"
-gem "discard", "~> 1.2"
+gem "discard", "~> 2.0"
 gem "kaminari-activerecord"
 gem "paper_trail"
 gem "pg"
@@ -99,6 +100,10 @@ gem "datadog", require: false
 # Storage
 gem "aws-sdk-s3", require: false
 gem "google-cloud-storage", require: false
+# google-apis-core < 1.2.1 loads representable/json, which calls `gem "multi_json"`
+# without declaring the dependency. googleauth 1.17 and signet 0.22 both migrated to
+# stdlib json, so multi_json is no longer pulled in transitively and must be pinned.
+gem "multi_json", require: false
 
 # Templating
 gem "slim"
@@ -114,7 +119,6 @@ gem "valvat"
 
 # Data Export
 gem "csv", "~> 3.0"
-gem "ostruct"
 
 gem "lago-expression", github: "getlago/lago-expression", glob: "expression-ruby/lago-expression.gemspec", ref: "2abd2b3"
 
@@ -134,7 +138,7 @@ group :development, :test do
   gem "webmock"
   gem "awesome_print"
   gem "pry-byebug"
-  gem "knapsack_pro", "~> 9.0"
+  gem "knapsack_pro", "~> 10.0"
   gem "parallel_tests", "~> 5.3"
 
   gem "database_cleaner-active_record"
@@ -151,8 +155,8 @@ group :development, :test do
   gem "rubocop-factory_bot", require: false
   gem "rubocop-thread_safety", require: false
 
-  gem "vernier", "~> 1.0", require: false
-  gem "super_diff", "~> 0.18.0"
+  gem "vernier", "~> 1.10", require: false
+  gem "super_diff", "~> 0.19.0"
 end
 
 group :test do

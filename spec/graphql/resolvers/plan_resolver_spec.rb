@@ -40,6 +40,7 @@ RSpec.describe Resolvers::PlanResolver do
             properties {
               amount
               pricingGroupKeys
+              presentationGroupKeys { value options { displayInInvoice } }
               freeUnits
               packageSize
               fixedAmount
@@ -193,13 +194,27 @@ RSpec.describe Resolvers::PlanResolver do
 
   context "when plan has charges" do
     before do
-      create(:standard_charge, billable_metric:, plan:)
+      create(
+        :standard_charge,
+        billable_metric:,
+        plan:,
+        properties: {
+          amount: "100",
+          presentation_group_keys: [
+            {"value" => "region", "options" => {"display_in_invoice" => true}}
+          ]
+        }
+      )
     end
 
     it "returns true for has charges" do
       plan_response = result["data"]["plan"]
 
       expect(plan_response["hasCharges"]).to eq(true)
+
+      expect(plan_response["charges"].sole.dig("properties", "presentationGroupKeys")).to eq([
+        {"value" => "region", "options" => {"displayInInvoice" => true}}
+      ])
     end
   end
 
@@ -322,6 +337,29 @@ RSpec.describe Resolvers::PlanResolver do
       it "doesn't return entitlements to avoid confusion" do
         expect(result["data"]["plan"]["entitlements"]).to be_empty
       end
+    end
+  end
+
+  context "when the plan uses the product catalog" do
+    let(:query) do
+      <<~GQL
+        query($planId: ID!) {
+          plan(id: $planId) { id amountCents interval payInAdvance }
+        }
+      GQL
+    end
+
+    let(:plan) do
+      create(:plan, organization:, pricing_type: "product_catalog", interval: nil, amount_cents: nil, pay_in_advance: nil)
+    end
+
+    it "returns the plan with null plan-level billing fields" do
+      expect(result["data"]["plan"]).to eq(
+        "id" => plan.id,
+        "amountCents" => nil,
+        "interval" => nil,
+        "payInAdvance" => nil
+      )
     end
   end
 

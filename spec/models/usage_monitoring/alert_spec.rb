@@ -22,6 +22,8 @@ RSpec.describe UsageMonitoring::Alert do
       expect(subject).to have_many(:thresholds).class_name("UsageMonitoring::AlertThreshold")
         .with_foreign_key(:usage_monitoring_alert_id).dependent(:delete_all)
       expect(subject).to have_many(:triggered_alerts).class_name("UsageMonitoring::TriggeredAlert")
+        .with_foreign_key(:usage_monitoring_alert_id).conditions(kind: "triggered")
+      expect(subject).to have_many(:all_triggered_alerts).class_name("UsageMonitoring::TriggeredAlert")
         .with_foreign_key(:usage_monitoring_alert_id)
     end
   end
@@ -94,6 +96,21 @@ RSpec.describe UsageMonitoring::Alert do
   end
 
   describe "#find_thresholds_crossed" do
+    context "when alert has only recurring thresholds (no one-time thresholds)" do
+      let(:alert) { create(:alert, code: "only-recurring", thresholds: nil, recurring_threshold: 100) }
+
+      it "does not raise ArgumentError for increasing direction" do
+        alert.previous_value = 0
+        expect(alert.find_thresholds_crossed(150)).to eq([100])
+      end
+
+      it "does not raise ArgumentError for decreasing direction" do
+        alert.direction = "decreasing"
+        alert.previous_value = 50
+        expect(alert.find_thresholds_crossed(-150)).to eq([-100])
+      end
+    end
+
     context "when direction is increasing" do
       it "returns threshold values between previous_value and current (inclusive)" do
         alert.previous_value = 8

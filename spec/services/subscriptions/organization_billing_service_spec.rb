@@ -442,8 +442,167 @@ RSpec.describe Subscriptions::OrganizationBillingService do
       end
     end
 
+    context "when grouping subscriptions by currency" do
+      let(:organization) { create(:organization) }
+      let(:interval) { :monthly }
+      let(:billing_time) { :anniversary }
+      let(:current_date) { subscription_at.next_month }
+
+      before { subscription.destroy }
+
+      context "when subscriptions have different currencies" do
+        let(:usd_plan) { create(:plan, organization:, interval:, amount_currency: "USD") }
+        let(:eur_plan) { create(:plan, organization:, interval:, amount_currency: "EUR") }
+
+        let(:usd_subscription) do
+          create(
+            :subscription,
+            customer:,
+            plan: usd_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+        let(:eur_subscription) do
+          create(
+            :subscription,
+            customer:,
+            plan: eur_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+
+        before do
+          usd_subscription
+          eur_subscription
+        end
+
+        it "produces separate billing jobs per currency" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([usd_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([eur_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with([usd_subscription], current_date)
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with([eur_subscription], current_date)
+        end
+      end
+
+      context "when subscriptions share the same currency" do
+        let(:plan1) { create(:plan, organization:, interval:, amount_currency: "USD") }
+        let(:plan2) { create(:plan, organization:, interval:, amount_currency: "USD") }
+
+        let(:subscription1) do
+          create(
+            :subscription,
+            customer:,
+            plan: plan1,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+        let(:subscription2) do
+          create(
+            :subscription,
+            customer:,
+            plan: plan2,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+
+        before do
+          subscription1
+          subscription2
+        end
+
+        it "groups them into a single billing job" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with(
+              contain_exactly(subscription1, subscription2),
+              current_date.to_i,
+              invoicing_reason: :subscription_periodic
+            )
+        end
+      end
+
+      context "when combined with payment method grouping" do
+        let(:organization) { create(:organization) }
+        let(:usd_plan) { create(:plan, organization:, interval:, amount_currency: "USD") }
+        let(:eur_plan) { create(:plan, organization:, interval:, amount_currency: "EUR") }
+
+        let(:usd_provider_subscription) do
+          create(
+            :subscription,
+            customer:,
+            plan: usd_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "provider"
+          )
+        end
+        let(:usd_manual_subscription) do
+          create(
+            :subscription,
+            customer:,
+            plan: usd_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "manual"
+          )
+        end
+        let(:eur_provider_subscription) do
+          create(
+            :subscription,
+            customer:,
+            plan: eur_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "provider"
+          )
+        end
+
+        before do
+          usd_provider_subscription
+          usd_manual_subscription
+          eur_provider_subscription
+        end
+
+        it "produces separate billing jobs per payment method and currency" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([usd_provider_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([usd_manual_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([eur_provider_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+        end
+      end
+    end
+
     context "when grouping subscriptions by payment method" do
-      let(:organization) { create(:organization, feature_flags: ["multiple_payment_methods"]) }
+      let(:organization) { create(:organization) }
       let(:interval) { :monthly }
       let(:billing_time) { :anniversary }
       let(:current_date) { subscription_at.next_month }
@@ -551,21 +710,10 @@ RSpec.describe Subscriptions::OrganizationBillingService do
             .with([subscription1], current_date.to_i, invoicing_reason: :subscription_periodic)
           expect(BillSubscriptionJob).to have_been_enqueued
             .with([subscription2], current_date.to_i, invoicing_reason: :subscription_periodic)
-        end
-
-        context "without feature flag" do
-          let(:organization) { create(:organization) }
-
-          it "does not group subscriptions into separate billing jobs" do
-            billing_service.call
-
-            expect(BillSubscriptionJob).to have_been_enqueued
-              .with(
-                contain_exactly(subscription1, subscription2),
-                current_date.to_i,
-                invoicing_reason: :subscription_periodic
-              )
-          end
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with([subscription1], current_date)
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with([subscription2], current_date)
         end
       end
 
@@ -748,6 +896,657 @@ RSpec.describe Subscriptions::OrganizationBillingService do
             .with([subscription1], current_date.to_i, invoicing_reason: :subscription_periodic)
         end
       end
+    end
+
+    context "when grouping subscriptions by billing entity" do
+      let(:organization) { create(:organization) }
+      let(:billing_entity) { create(:billing_entity, organization:) }
+      let(:other_billing_entity) { create(:billing_entity, organization:) }
+      let(:interval) { :monthly }
+      let(:billing_time) { :anniversary }
+      let(:current_date) { subscription_at.next_month }
+
+      before { subscription.destroy }
+
+      context "when subscriptions have different billing entities" do
+        let(:subscription_default_entity) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+        let(:subscription_other_entity) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            billing_entity: other_billing_entity,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+
+        before do
+          subscription_default_entity
+          subscription_other_entity
+        end
+
+        it "produces separate billing jobs per billing entity" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([subscription_default_entity], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([subscription_other_entity], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with([subscription_default_entity], current_date)
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with([subscription_other_entity], current_date)
+        end
+      end
+
+      context "when subscriptions share the same effective billing entity" do
+        let(:subscription1) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+        let(:subscription2) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            billing_entity: customer.billing_entity,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+
+        before do
+          subscription1
+          subscription2
+        end
+
+        it "groups them into a single billing job" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with(
+              contain_exactly(subscription1, subscription2),
+              current_date.to_i,
+              invoicing_reason: :subscription_periodic
+            )
+        end
+      end
+    end
+
+    context "when grouping subscriptions by purchase order number" do
+      let(:interval) { :monthly }
+      let(:billing_time) { :anniversary }
+      let(:current_date) { subscription_at.next_month }
+      let(:first_purchase_order_number) { "PO-123" }
+      let(:second_purchase_order_number) { "PO-123" }
+
+      let(:first_subscription) do
+        create(
+          :subscription,
+          customer:,
+          plan:,
+          subscription_at:,
+          started_at: current_date - 10.days,
+          billing_time:,
+          created_at:,
+          purchase_order_number: first_purchase_order_number
+        )
+      end
+      let(:second_subscription) do
+        create(
+          :subscription,
+          customer:,
+          plan:,
+          subscription_at:,
+          started_at: current_date - 10.days,
+          billing_time:,
+          created_at:,
+          purchase_order_number: second_purchase_order_number
+        )
+      end
+
+      before do
+        subscription.destroy
+        first_subscription
+        second_subscription
+      end
+
+      it "groups subscriptions with the same purchase order number into a single billing job" do
+        billing_service.call
+
+        expect(BillSubscriptionJob).to have_been_enqueued
+          .with(
+            contain_exactly(first_subscription, second_subscription),
+            current_date.to_i,
+            invoicing_reason: :subscription_periodic
+          )
+        expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+          .with(contain_exactly(first_subscription, second_subscription), current_date)
+      end
+
+      context "when subscriptions have different purchase order numbers" do
+        let(:second_purchase_order_number) { "PO-456" }
+
+        it "produces separate billing jobs per purchase order number" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([first_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([second_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with([first_subscription], current_date)
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with([second_subscription], current_date)
+        end
+      end
+
+      context "when subscriptions have nil purchase order numbers" do
+        let(:first_purchase_order_number) { nil }
+        let(:second_purchase_order_number) { nil }
+
+        it "groups them into a single billing job" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with(
+              contain_exactly(first_subscription, second_subscription),
+              current_date.to_i,
+              invoicing_reason: :subscription_periodic
+            )
+        end
+      end
+    end
+
+    context "when a subscription opts out of invoice consolidation" do
+      let(:interval) { :monthly }
+      let(:billing_time) { :anniversary }
+      let(:current_date) { subscription_at.next_month }
+
+      let(:consolidated_subscription) do
+        create(
+          :subscription,
+          customer:,
+          plan:,
+          subscription_at:,
+          started_at: current_date - 10.days,
+          billing_time:,
+          created_at:
+        )
+      end
+      let(:opted_out_subscription) do
+        create(
+          :subscription,
+          customer:,
+          plan:,
+          subscription_at:,
+          started_at: current_date - 10.days,
+          billing_time:,
+          created_at:,
+          consolidate_invoice: false
+        )
+      end
+
+      before do
+        subscription.destroy
+        consolidated_subscription
+        opted_out_subscription
+      end
+
+      it "bills the opted-out subscription on its own and consolidates the others" do
+        billing_service.call
+
+        expect(BillSubscriptionJob).to have_been_enqueued
+          .with([consolidated_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+        expect(BillSubscriptionJob).to have_been_enqueued
+          .with([opted_out_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+        expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+          .with([consolidated_subscription], current_date)
+        expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+          .with([opted_out_subscription], current_date)
+      end
+
+      context "when several subscriptions opt out" do
+        let(:other_opted_out_subscription) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            consolidate_invoice: false
+          )
+        end
+
+        before { other_opted_out_subscription }
+
+        it "produces a dedicated billing job per opted-out subscription" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([opted_out_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([other_opted_out_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([consolidated_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+        end
+      end
+
+      context "when all subscriptions opt out" do
+        let(:consolidated_subscription) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            consolidate_invoice: false
+          )
+        end
+
+        it "produces a one-subscription billing job per subscription with no empty groups" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([consolidated_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([opted_out_subscription], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).not_to have_been_enqueued
+            .with([], current_date.to_i, invoicing_reason: :subscription_periodic)
+        end
+      end
+
+      context "when combined with currency grouping" do
+        let(:organization) { create(:organization) }
+        let(:usd_plan) { create(:plan, organization:, interval:, amount_currency: "USD") }
+        let(:eur_plan) { create(:plan, organization:, interval:, amount_currency: "EUR") }
+
+        let(:usd_consolidated) do
+          create(
+            :subscription,
+            customer:,
+            plan: usd_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+        let(:other_usd_consolidated) do
+          create(
+            :subscription,
+            customer:,
+            plan: usd_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+        let(:eur_consolidated) do
+          create(
+            :subscription,
+            customer:,
+            plan: eur_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+        let(:usd_opted_out) do
+          create(
+            :subscription,
+            customer:,
+            plan: usd_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            consolidate_invoice: false
+          )
+        end
+
+        before do
+          consolidated_subscription.destroy
+          opted_out_subscription.destroy
+          usd_consolidated
+          other_usd_consolidated
+          eur_consolidated
+          usd_opted_out
+        end
+
+        it "keeps currency groups together while splitting the opted-out subscription out" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with(contain_exactly(usd_consolidated, other_usd_consolidated), current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([eur_consolidated], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([usd_opted_out], current_date.to_i, invoicing_reason: :subscription_periodic)
+        end
+      end
+
+      context "when combined with billing entity grouping" do
+        let(:organization) { create(:organization) }
+        let(:other_billing_entity) { create(:billing_entity, organization:) }
+
+        let(:default_entity_consolidated) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+        let(:other_default_entity_consolidated) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+        let(:other_entity_consolidated) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            billing_entity: other_billing_entity,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:
+          )
+        end
+        let(:other_entity_opted_out) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            billing_entity: other_billing_entity,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            consolidate_invoice: false
+          )
+        end
+
+        before do
+          consolidated_subscription.destroy
+          opted_out_subscription.destroy
+          default_entity_consolidated
+          other_default_entity_consolidated
+          other_entity_consolidated
+          other_entity_opted_out
+        end
+
+        it "keeps billing entity groups together while splitting the opted-out subscription out" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with(contain_exactly(default_entity_consolidated, other_default_entity_consolidated), current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([other_entity_consolidated], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([other_entity_opted_out], current_date.to_i, invoicing_reason: :subscription_periodic)
+        end
+      end
+
+      context "when combined with payment method grouping" do
+        let(:organization) { create(:organization) }
+
+        let(:provider_consolidated) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "provider"
+          )
+        end
+        let(:other_provider_consolidated) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "provider"
+          )
+        end
+        let(:manual_consolidated) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "manual"
+          )
+        end
+        let(:provider_opted_out) do
+          create(
+            :subscription,
+            customer:,
+            plan:,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "provider",
+            consolidate_invoice: false
+          )
+        end
+
+        before do
+          consolidated_subscription.destroy
+          opted_out_subscription.destroy
+          provider_consolidated
+          other_provider_consolidated
+          manual_consolidated
+          provider_opted_out
+        end
+
+        it "keeps payment method groups together while splitting the opted-out subscription out" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with(contain_exactly(provider_consolidated, other_provider_consolidated), current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([manual_consolidated], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([provider_opted_out], current_date.to_i, invoicing_reason: :subscription_periodic)
+        end
+      end
+
+      context "when combined with payment method, currency and billing entity grouping" do
+        let(:organization) do
+          create(:organization)
+        end
+        let(:other_billing_entity) { create(:billing_entity, organization:) }
+        let(:usd_plan) { create(:plan, organization:, interval:, amount_currency: "USD") }
+        let(:eur_plan) { create(:plan, organization:, interval:, amount_currency: "EUR") }
+
+        let(:default_usd_provider) do
+          create(
+            :subscription,
+            customer:,
+            plan: usd_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "provider"
+          )
+        end
+        let(:other_default_usd_provider) do
+          create(
+            :subscription,
+            customer:,
+            plan: usd_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "provider"
+          )
+        end
+        let(:default_eur_provider) do
+          create(
+            :subscription,
+            customer:,
+            plan: eur_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "provider"
+          )
+        end
+        let(:default_usd_manual) do
+          create(
+            :subscription,
+            customer:,
+            plan: usd_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "manual"
+          )
+        end
+        let(:other_entity_usd_provider) do
+          create(
+            :subscription,
+            customer:,
+            plan: usd_plan,
+            billing_entity: other_billing_entity,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "provider"
+          )
+        end
+        let(:default_usd_provider_opted_out) do
+          create(
+            :subscription,
+            customer:,
+            plan: usd_plan,
+            subscription_at:,
+            started_at: current_date - 10.days,
+            billing_time:,
+            created_at:,
+            payment_method_type: "provider",
+            consolidate_invoice: false
+          )
+        end
+
+        before do
+          consolidated_subscription.destroy
+          opted_out_subscription.destroy
+          default_usd_provider
+          other_default_usd_provider
+          default_eur_provider
+          default_usd_manual
+          other_entity_usd_provider
+          default_usd_provider_opted_out
+        end
+
+        it "splits the opted-out subscription out of its (default-entity, USD, provider) group" do
+          billing_service.call
+
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with(contain_exactly(default_usd_provider, other_default_usd_provider), current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([default_eur_provider], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([default_usd_manual], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([other_entity_usd_provider], current_date.to_i, invoicing_reason: :subscription_periodic)
+          expect(BillSubscriptionJob).to have_been_enqueued
+            .with([default_usd_provider_opted_out], current_date.to_i, invoicing_reason: :subscription_periodic)
+
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with(contain_exactly(default_usd_provider, other_default_usd_provider), current_date)
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with([default_eur_provider], current_date)
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with([default_usd_manual], current_date)
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with([other_entity_usd_provider], current_date)
+          expect(BillNonInvoiceableFeesJob).to have_been_enqueued
+            .with([default_usd_provider_opted_out], current_date)
+        end
+      end
+    end
+  end
+
+  describe "database routing" do
+    let(:billing_entity) { create(:billing_entity) }
+    let(:organization) { billing_entity.organization }
+    let(:billing_at) { Time.current }
+
+    it "wraps the >16 KB billable-subscriptions CTE in ApplicationRecord.connected_to(role: :direct)" do
+      # The rendered SQL is ~28 KB and would session-pin RDS Proxy for
+      # Postgres. Verify the query executes on the :direct role so it
+      # bypasses the pooler regardless of which Sidekiq worker picks
+      # the job up. We yield through the stub instead of `and_call_original`
+      # so the underlying query still runs on the default pool — that
+      # keeps this test independent of cross-pool transaction visibility
+      # in the test env, where :direct and :writing resolve to the same URL.
+      wrapped_role = nil
+      allow(ApplicationRecord).to receive(:connected_to) do |role:, &block|
+        wrapped_role = role
+        block.call
+      end
+
+      billing_service.call
+
+      expect(wrapped_role).to eq(:direct)
+      expect(ApplicationRecord).to have_received(:connected_to).with(role: :direct).at_least(:once)
     end
   end
 end

@@ -14,8 +14,13 @@ class User < ApplicationRecord
   has_many :active_memberships, -> { where(status: "active") }, class_name: "Membership"
   has_many :active_organizations, through: :active_memberships, source: :organization
 
+  has_many :quote_owners, dependent: :destroy
+  has_many :quotes, through: :quote_owners
+
   validates :email, presence: true
   validates :password, presence: true
+
+  normalizes :email, with: ->(email) { EmailSanitizer.call(email) }
 
   def can?(permission, organization:)
     memberships.find { |m| m.organization_id == organization.id }&.can?(permission)

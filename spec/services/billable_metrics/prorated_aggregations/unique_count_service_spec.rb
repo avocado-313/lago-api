@@ -18,7 +18,7 @@ RSpec.describe BillableMetrics::ProratedAggregations::UniqueCountService, transa
   end
 
   let(:event_store_class) { Events::Stores::PostgresStore }
-  let(:filters) { {event: pay_in_advance_event, grouped_by:, matching_filters:, ignored_filters:} }
+  let(:filters) { {event: pay_in_advance_event, grouped_by:, presentation_by:, matching_filters:, ignored_filters:} }
 
   let(:subscription) do
     create(
@@ -36,6 +36,7 @@ RSpec.describe BillableMetrics::ProratedAggregations::UniqueCountService, transa
   let(:organization) { subscription.organization }
   let(:customer) { subscription.customer }
   let(:grouped_by) { nil }
+  let(:presentation_by) { nil }
   let(:matching_filters) { nil }
   let(:ignored_filters) { nil }
 
@@ -60,7 +61,6 @@ RSpec.describe BillableMetrics::ProratedAggregations::UniqueCountService, transa
   let(:to_datetime) { Time.zone.parse("2022-08-08 23:59:59 UTC") }
 
   let(:added_at) { from_datetime - 1.month }
-  let(:removed_at) { nil }
   let(:event) do
     create(
       :event,
@@ -76,6 +76,86 @@ RSpec.describe BillableMetrics::ProratedAggregations::UniqueCountService, transa
 
   describe "#aggregate" do
     let(:result) { unique_count_service.aggregate(options:) }
+
+    context "with presentation group keys" do
+      let(:presentation_by) { ["cloud"] }
+
+      let(:event) do
+        create(
+          :event,
+          organization_id: organization.id,
+          code: billable_metric.code,
+          external_subscription_id: subscription.external_id,
+          timestamp: added_at,
+          properties: {unique_id: "001", cloud: "aws"}
+        )
+      end
+
+      let(:new_event) do
+        create(
+          :event,
+          organization_id: organization.id,
+          code: billable_metric.code,
+          external_subscription_id: subscription.external_id,
+          timestamp: from_datetime + 10.days,
+          properties: {unique_id: "002", cloud: "gcp"}
+        )
+      end
+
+      before { new_event }
+
+      it "returns the presentation breakdowns" do
+        expect(result.breakdowns).to match_array([
+          {groups: {"cloud" => "aws"}, value: 1},
+          {groups: {"cloud" => "gcp"}, value: 1}
+        ])
+      end
+
+      context "with grouped_by" do
+        let(:grouped_by) { ["agent_name"] }
+        let(:event) { nil }
+
+        let(:unique_count_events) do
+          [
+            create(
+              :event,
+              organization_id: organization.id,
+              code: billable_metric.code,
+              external_subscription_id: subscription.external_id,
+              timestamp: added_at,
+              properties: {unique_id: "003", agent_name: "frodo", cloud: "aws"}
+            ),
+            create(
+              :event,
+              organization_id: organization.id,
+              code: billable_metric.code,
+              external_subscription_id: subscription.external_id,
+              timestamp: from_datetime + 10.days,
+              properties: {unique_id: "004", agent_name: "frodo", cloud: "gcp"}
+            ),
+            create(
+              :event,
+              organization_id: organization.id,
+              code: billable_metric.code,
+              external_subscription_id: subscription.external_id,
+              timestamp: added_at,
+              properties: {unique_id: "005", agent_name: "aragorn", cloud: "aws"}
+            )
+          ]
+        end
+
+        before { unique_count_events }
+
+        it "returns the presentation breakdowns per group" do
+          expect(result.breakdowns).to match_array([
+            {groups: {"agent_name" => "frodo", "cloud" => "aws"}, value: 1},
+            {groups: {"agent_name" => "frodo", "cloud" => "gcp"}, value: 1},
+            {groups: {"agent_name" => "aragorn", "cloud" => "aws"}, value: 1},
+            {groups: {"agent_name" => nil, "cloud" => "gcp"}, value: 1}
+          ])
+        end
+      end
+    end
 
     context "with persisted metric on full period" do
       it "returns the number of persisted metric" do
@@ -471,6 +551,29 @@ RSpec.describe BillableMetrics::ProratedAggregations::UniqueCountService, transa
           expect(result.current_usage_units).to eq(1)
         end
       end
+
+      context "when cached aggregation is negative" do
+        let(:previous_event) { nil }
+
+        let(:cached_aggregation) do
+          create(
+            :cached_aggregation,
+            organization:,
+            charge:,
+            event_transaction_id: event.transaction_id,
+            external_subscription_id: subscription.external_id,
+            timestamp: from_datetime + 5.days,
+            current_aggregation: "-1",
+            max_aggregation: "1",
+            max_aggregation_with_proration: "0.8"
+          )
+        end
+
+        it "does not inflate the aggregation with the negative units" do
+          expect(result.aggregation).to eq(1.8)
+          expect(result.current_usage_units).to eq(1)
+        end
+      end
     end
 
     context "when event is given" do
@@ -490,6 +593,17 @@ RSpec.describe BillableMetrics::ProratedAggregations::UniqueCountService, transa
 
       it "assigns an pay_in_advance aggregation" do
         expect(result.pay_in_advance_aggregation).to eq(21.fdiv(31).ceil(5))
+      end
+
+      context "with presentation group keys" do
+        let(:presentation_by) { ["cloud", "region"] }
+        let(:properties) { {"unique_id" => SecureRandom.uuid, "cloud" => "aws", "region" => "eu"} }
+
+        it "assigns pay_in_advance_breakdowns based on the pay_in_advance event" do
+          expect(result.pay_in_advance_breakdowns).to eq([
+            {groups: {"cloud" => "aws", "region" => "eu"}, value: 1}
+          ])
+        end
       end
 
       context "when event is missing properties" do
@@ -929,6 +1043,70 @@ RSpec.describe BillableMetrics::ProratedAggregations::UniqueCountService, transa
 
   describe ".per_event_aggregation" do
     before { unique_count_service.options = {} }
+
+    context "when aggregation is bypassed" do
+      subject(:unique_count_service) do
+        described_class.new(
+          event_store_class:,
+          charge:,
+          subscription:,
+          boundaries: {
+            from_datetime:,
+            to_datetime:,
+            charges_duration: 31
+          },
+          filters:,
+          bypass_aggregation: true
+        )
+      end
+
+      let(:billable_metric) do
+        create(
+          :billable_metric,
+          organization:,
+          aggregation_type: "unique_count_agg",
+          field_name: "unique_id",
+          recurring: false
+        )
+      end
+
+      it "returns empty aggregations without querying the event store" do
+        event_store = unique_count_service.__send__(:event_store)
+        allow(event_store).to receive(:prorated_unique_count_breakdown).and_call_original
+
+        result = unique_count_service.per_event_aggregation
+
+        expect(result.event_aggregation).to eq([])
+        expect(result.event_prorated_aggregation).to eq([])
+        expect(event_store).not_to have_received(:prorated_unique_count_breakdown)
+      end
+    end
+
+    context "when aggregation is bypassed and metric is recurring" do
+      subject(:unique_count_service) do
+        described_class.new(
+          event_store_class:,
+          charge:,
+          subscription:,
+          boundaries: {
+            from_datetime:,
+            to_datetime:,
+            charges_duration: 31
+          },
+          filters:,
+          bypass_aggregation: true
+        )
+      end
+
+      let(:added_at) { from_datetime + 10.days }
+
+      it "ignores the bypass and aggregates per events" do
+        result = unique_count_service.per_event_aggregation
+
+        expect(result.event_aggregation).to eq([1])
+        expect(result.event_prorated_aggregation.map { |el| el.ceil(5) }).to eq([21.fdiv(31).ceil(5)])
+      end
+    end
 
     context "with event added in the period" do
       let(:added_at) { from_datetime + 10.days }

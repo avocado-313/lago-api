@@ -22,8 +22,14 @@ RSpec.describe Organization do
       expect(subject).to have_many(:billing_entities).conditions(archived_at: nil)
       expect(subject).to have_many(:all_billing_entities).class_name("BillingEntity")
       expect(subject).to have_many(:pricing_units)
+      expect(subject).to have_many(:product_categories)
+      expect(subject).to have_many(:products)
+      expect(subject).to have_many(:product_filters)
+      expect(subject).to have_many(:rate_cards)
+      expect(subject).to have_many(:rate_card_rates)
       expect(subject).to have_many(:customers)
       expect(subject).to have_many(:subscriptions)
+      expect(subject).to have_many(:contracts)
       expect(subject).to have_many(:activation_rules).class_name("Subscription::ActivationRule")
       expect(subject).to have_many(:credit_notes)
       expect(subject).to have_many(:invoices)
@@ -56,6 +62,10 @@ RSpec.describe Organization do
       expect(subject).to have_one(:applied_dunning_campaign).conditions(applied_to_organization: true)
       expect(subject).to have_one(:enriched_store_migration)
       expect(subject).to have_many(:pending_vies_checks)
+      expect(subject).to have_many(:order_forms)
+      expect(subject).to have_many(:orders)
+      expect(subject).to have_many(:triggered_alerts).class_name("UsageMonitoring::TriggeredAlert")
+        .conditions(kind: "triggered")
     end
   end
 
@@ -199,6 +209,31 @@ RSpec.describe Organization do
       end
     end
 
+    describe "of slug" do
+      it "validates length, format, and exclusion" do
+        organization.slug = "ab"
+        expect(organization).not_to be_valid
+
+        organization.slug = "a" * 41
+        expect(organization).not_to be_valid
+
+        organization.slug = "-invalid"
+        expect(organization).not_to be_valid
+
+        organization.slug = "customers"
+        expect(organization).not_to be_valid
+
+        organization.slug = "valid-slug"
+        expect(organization).to be_valid
+      end
+
+      it "validates presence on persisted record" do
+        persisted_org = create(:organization)
+        persisted_org.slug = nil
+        expect(persisted_org).not_to be_valid
+      end
+    end
+
     describe "of premium_integrations inclusion" do
       context "when it includes an invalid integration" do
         subject(:organization) { build(:organization, premium_integrations: ["invalid_integration"]) }
@@ -238,6 +273,18 @@ RSpec.describe Organization do
 
       it "sets unique hmac key" do
         expect { subject }.to change(organization, :hmac_key).to unique_hmac_key
+      end
+
+      it "auto-generates slug from name when not provided" do
+        org = build(:organization, name: "Acme Corporation", slug: nil)
+        org.save!
+        expect(org.slug).to eq("acme-corporation")
+      end
+
+      it "keeps provided slug when present" do
+        org = build(:organization, name: "Acme Corporation", slug: "custom-slug")
+        org.save!
+        expect(org.slug).to eq("custom-slug")
       end
     end
 
@@ -514,6 +561,20 @@ RSpec.describe Organization do
       it "returns false" do
         expect(organization).not_to be_clickhouse_events_store
         expect(organization).to be_postgres_events_store
+      end
+    end
+  end
+
+  describe "#events_store" do
+    it "returns the events store" do
+      expect(organization.events_store).to eq("postgres")
+    end
+
+    context "when clickhouse_events_store is true" do
+      let(:organization) { create(:organization, clickhouse_events_store: true) }
+
+      it "returns clickhouse" do
+        expect(organization.events_store).to eq("clickhouse")
       end
     end
   end

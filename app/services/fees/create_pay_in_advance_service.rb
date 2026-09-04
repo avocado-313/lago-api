@@ -16,6 +16,8 @@ module Fees
     end
 
     def call
+      return skip_missing_subscription if subscription.nil?
+
       fees = []
 
       ActiveRecord::Base.transaction(**isolation_mode) do
@@ -47,6 +49,24 @@ module Fees
 
     private
 
+    def skip_missing_subscription
+      # NOTE: `event.subscription` is nil when the subscription was terminated before the
+      # event's timestamp (e.g. enqueued while active, terminated before the job ran).
+      message = "Fees::CreatePayInAdvanceService skipped: no active subscription for event"
+      context = {
+        organization_id: event.organization_id,
+        external_subscription_id: event.external_subscription_id,
+        charge_id: charge.id,
+        event_transaction_id: event.transaction_id,
+        event_timestamp: billing_at.iso8601
+      }
+
+      Rails.logger.warn("#{message} #{context.map { |k, v| "#{k}=#{v}" }.join(" ")}")
+
+      result.fees = []
+      result
+    end
+
     attr_reader :charge, :event, :billing_at, :estimate
 
     delegate :billable_metric, to: :charge
@@ -58,7 +78,6 @@ module Fees
 
     def init_fee(properties:, charge_filter: nil)
       aggregation_result = aggregate(properties:, charge_filter:)
-
       cache_aggregation_result(aggregation_result:, charge_filter:)
 
       charge_model_result = apply_charge_model(aggregation_result:, properties:)
@@ -81,7 +100,7 @@ module Fees
         precise_unit_amount = charge_model_result.unit_amount
       end
 
-      Fee.new(
+      fee = Fee.new(
         subscription:,
         charge:,
         organization_id: customer.organization_id,
@@ -108,6 +127,10 @@ module Fees
         amount_details: charge_model_result.amount_details || {},
         pricing_unit_usage:
       )
+
+      build_breakdowns_for_fee(fee:, presentation_breakdowns: remove_formated_grouped_by_keys(aggregation_result.pay_in_advance_breakdowns))
+
+      fee
     end
 
     def init_charge_filter_fee
@@ -171,6 +194,16 @@ module Fees
       result.fees.each { |f| SendWebhookJob.perform_later("fee.created", f) }
     end
 
+    def build_breakdowns_for_fee(fee:, presentation_breakdowns:)
+      presentation_breakdowns.each do |breakdown|
+        fee.presentation_breakdowns.build(
+          presentation_by: breakdown[:groups],
+          units: breakdown[:value],
+          organization_id: charge.organization_id
+        )
+      end
+    end
+
     def cache_aggregation_result(aggregation_result:, charge_filter:)
       return unless aggregation_result.current_aggregation.present? ||
         aggregation_result.max_aggregation.present? ||
@@ -187,16 +220,23 @@ module Fees
         current_amount: aggregation_result.current_amount,
         max_aggregation: aggregation_result.max_aggregation,
         max_aggregation_with_proration: aggregation_result.max_aggregation_with_proration,
-        grouped_by: format_grouped_by
+        grouped_by: format_grouped_by,
+        presentation_breakdowns: remove_formated_grouped_by_keys(aggregation_result.breakdowns)
       )
     end
 
+    def remove_formated_grouped_by_keys(breakdowns)
+      Array(breakdowns).map { |b| b.merge(groups: b[:groups].except(*format_grouped_by.keys)) }
+    end
+
     def format_grouped_by
+      return @format_grouped_by if defined?(@format_grouped_by)
+
       grouped_by = properties["pricing_group_keys"].presence || properties["grouped_by"] || []
       grouped_by << "target_wallet_code" if charge.accepts_target_wallet && event.properties["target_wallet_code"].present?
-      return {} if grouped_by.blank?
+      return @format_grouped_by = {} if grouped_by.blank?
 
-      grouped_by.index_with { event.properties[it] }
+      @format_grouped_by = grouped_by.index_with { event.properties[it] }
     end
 
     def customer

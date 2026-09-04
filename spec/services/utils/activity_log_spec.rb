@@ -72,7 +72,7 @@ RSpec.describe Utils::ActivityLog, :capture_kafka_messages do
     end
 
     context "when kafka is configured", :kafka_configured do
-      let(:result) { BaseService::Result.new }
+      let(:result) { Coupons::UpdateService::Result.new }
 
       context "when providing a block" do
         let(:activity_type) { "coupon.updated" }
@@ -134,6 +134,36 @@ RSpec.describe Utils::ActivityLog, :capture_kafka_messages do
               activity_object: V1::WalletTransactionSerializer.new(wallet_transaction).serialize,
               activity_object_changes: {},
               external_customer_id: wallet.customer.external_id,
+              external_subscription_id: nil
+            }.to_json
+          )
+        end
+      end
+
+      context "when the object is a quote version" do
+        let(:quote) { create(:quote, organization:) }
+        let(:quote_version) { create(:quote_version, quote:, organization:) }
+
+        it "uses quote as resource" do
+          activity_log.produce(quote_version, "quote.approved", activity_id: "activity-id") { BaseService::Result.new }
+
+          expect(karafka_producer).to have_received(:produce_async).with(
+            topic: "activity_logs",
+            key: "#{organization.id}--activity-id",
+            payload: {
+              activity_source: "api",
+              api_key_id: api_key.id,
+              user_id: nil,
+              activity_type: "quote.approved",
+              activity_id: "activity-id",
+              logged_at: Time.current.iso8601[...-1],
+              created_at: Time.current.iso8601[...-1],
+              resource_id: quote.id,
+              resource_type: "Quote",
+              organization_id: organization.id,
+              activity_object: V1::QuoteVersionSerializer.new(quote_version, includes: %i[billing_items]).serialize,
+              activity_object_changes: {},
+              external_customer_id: quote.customer.external_id,
               external_subscription_id: nil
             }.to_json
           )
@@ -237,6 +267,37 @@ RSpec.describe Utils::ActivityLog, :capture_kafka_messages do
           )
         end
       end
+
+      [
+        {exception: WaterDrop::Errors::ProduceError, message: "#<Rdkafka::RdkafkaError: Local: Unknown topic (unknown_topic)>"},
+        {exception: WaterDrop::Errors::MessageInvalidError, message: "Message is too large"}
+      ].each do |error_context|
+        exception = error_context[:exception]
+        message = error_context[:message]
+        context "when producer raises #{exception}" do
+          subject(:produce) { activity_log.produce(coupon, "coupon.created", activity_id: "activity-id") { result } }
+
+          let(:result) { BaseService::Result.new }
+
+          before do
+            allow(karafka_producer).to receive(:produce_async).and_raise(exception.new(message))
+          end
+
+          context "when sentry is configured", :sentry do
+            it "captures the exception and returns false" do
+              expect(produce).to be result
+              expect(sentry_events).to include_sentry_event(exception: exception, message: message)
+            end
+          end
+
+          context "when sentry is not configured" do
+            it "re-raises the error" do
+              expect { produce }.to raise_error(exception, message)
+              expect(sentry_events).to be_empty
+            end
+          end
+        end
+      end
     end
 
     context "when kafka is not configured" do
@@ -250,35 +311,35 @@ RSpec.describe Utils::ActivityLog, :capture_kafka_messages do
         expect(karafka_producer).not_to have_received(:produce_async)
       end
     end
+  end
 
-    describe ".available?" do
-      subject { activity_log.available? }
+  describe ".available?" do
+    subject { activity_log.available? }
 
-      context "without clickhouse" do
-        before do
-          ENV["LAGO_CLICKHOUSE_ENABLED"] = nil
-        end
-
-        it { is_expected.to be_falsey }
+    context "without clickhouse" do
+      before do
+        ENV["LAGO_CLICKHOUSE_ENABLED"] = nil
       end
 
-      context "without kafka vars" do
-        before do
-          ENV["LAGO_KAFKA_BOOTSTRAP_SERVERS"] = nil
-          ENV["LAGO_KAFKA_ACTIVITY_LOGS_TOPIC"] = nil
-          ENV["LAGO_CLICKHOUSE_ENABLED"] = "true"
-        end
+      it { is_expected.to be_falsey }
+    end
 
-        it { is_expected.to be_falsey }
+    context "without kafka vars" do
+      before do
+        ENV["LAGO_KAFKA_BOOTSTRAP_SERVERS"] = nil
+        ENV["LAGO_KAFKA_ACTIVITY_LOGS_TOPIC"] = nil
+        ENV["LAGO_CLICKHOUSE_ENABLED"] = "true"
       end
 
-      context "with everything configured", :kafka_configured do
-        before do
-          ENV["LAGO_CLICKHOUSE_ENABLED"] = "true"
-        end
+      it { is_expected.to be_falsey }
+    end
 
-        it { is_expected.to be_truthy }
+    context "with everything configured", :kafka_configured do
+      before do
+        ENV["LAGO_CLICKHOUSE_ENABLED"] = "true"
       end
+
+      it { is_expected.to be_truthy }
     end
   end
 
@@ -400,6 +461,22 @@ RSpec.describe Utils::ActivityLog, :capture_kafka_messages do
 
       it "returns the default includes for the object" do
         expect(method_call).to eq(serialized_includes)
+      end
+    end
+
+    context "when object is a quote" do
+      let(:object) { create(:quote, organization:) }
+
+      it "includes the owners" do
+        expect(method_call).to eq(%i[owners])
+      end
+    end
+
+    context "when object is a quote version" do
+      let(:object) { create(:quote_version, organization:) }
+
+      it "includes the billing items but not the content" do
+        expect(method_call).to eq(%i[billing_items])
       end
     end
 

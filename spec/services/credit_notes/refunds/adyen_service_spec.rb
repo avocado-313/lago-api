@@ -49,7 +49,6 @@ RSpec.describe CreditNotes::Refunds::AdyenService do
         .and_return(modifications_api)
       allow(modifications_api).to receive(:refund_captured_payment)
         .and_return(refunds_response)
-      allow(SegmentTrackJob).to receive(:perform_later)
     end
 
     it "creates a adyen refund and a refund" do
@@ -60,6 +59,8 @@ RSpec.describe CreditNotes::Refunds::AdyenService do
       expect(result.refund.id).to be_present
 
       expect(result.refund.credit_note).to eq(credit_note)
+      expect(result.refund.refundable).to eq(credit_note)
+      expect(result.refund.reason).to eq("credit_note")
       expect(result.refund.payment).to eq(payment)
       expect(result.refund.payment_provider).to eq(adyen_payment_provider)
       expect(result.refund.payment_provider_customer).to eq(adyen_customer)
@@ -75,7 +76,7 @@ RSpec.describe CreditNotes::Refunds::AdyenService do
     it "call SegmentTrackJob" do
       adyen_service.create
 
-      expect(SegmentTrackJob).to have_received(:perform_later).with(
+      expect(SegmentTrackJob).to have_been_enqueued.with(
         membership_id: CurrentContext.membership,
         event: "refund_status_changed",
         properties: {
@@ -191,6 +192,23 @@ RSpec.describe CreditNotes::Refunds::AdyenService do
         expect(result.credit_note.refunded_at).not_to be_present
       end
     end
+
+    context "when the provider was disconnected and reconnected" do
+      let(:reconnected_provider) { create(:adyen_provider, organization:, code: "adyen_reconnected") }
+      let(:reconnected_customer) { create(:adyen_customer, customer:, payment_provider: reconnected_provider) }
+
+      before do
+        adyen_customer.discard!
+        reconnected_customer
+      end
+
+      it "attaches the refund to the provider customer that holds the payment" do
+        result = adyen_service.create
+
+        expect(result).to be_success
+        expect(result.refund.payment_provider_customer_id).to eq(adyen_customer.id)
+      end
+    end
   end
 
   describe "#update_status" do
@@ -215,14 +233,12 @@ RSpec.describe CreditNotes::Refunds::AdyenService do
     end
 
     it "calls SegmentTrackJob" do
-      allow(SegmentTrackJob).to receive(:perform_later)
-
       adyen_service.update_status(
         provider_refund_id: refund.provider_refund_id,
         status: "succeeded"
       )
 
-      expect(SegmentTrackJob).to have_received(:perform_later).with(
+      expect(SegmentTrackJob).to have_been_enqueued.with(
         membership_id: CurrentContext.membership,
         event: "refund_status_changed",
         properties: {
@@ -292,7 +308,7 @@ RSpec.describe CreditNotes::Refunds::AdyenService do
 
     context "when status is failed" do
       before do
-        adyen_customer
+        payment
       end
 
       it "delivers an error webhook" do

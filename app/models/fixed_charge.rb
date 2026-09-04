@@ -17,6 +17,7 @@ class FixedCharge < ApplicationRecord
   has_many :taxes, through: :applied_taxes
   has_many :fees
   has_many :events, class_name: "FixedChargeEvent", dependent: :destroy
+  has_many :subscription_units_overrides, class_name: "Subscription::FixedChargeUnitsOverride"
 
   has_many :applied_taxes, class_name: "FixedCharge::AppliedTax", dependent: :destroy
   has_many :taxes, through: :applied_taxes
@@ -40,6 +41,7 @@ class FixedCharge < ApplicationRecord
   validates :properties, presence: true
 
   validate :validate_code_unique
+  validate :validate_plan_pricing_type
   validate :validate_pay_in_advance
   validate :validate_prorated
   validate :validate_properties
@@ -48,6 +50,20 @@ class FixedCharge < ApplicationRecord
     charge_model == fixed_charge.charge_model &&
       properties == fixed_charge.properties &&
       units == fixed_charge.units
+  end
+
+  def effective_units_for(subscription)
+    return units unless subscription
+
+    subscription_units_overrides.find_by(subscription:)&.units || units
+  end
+
+  def parent_or_self
+    if parent_id
+      parent
+    else
+      self
+    end
   end
 
   # When upgrading a subscription with fixed_charges paid_in_advance,
@@ -95,6 +111,13 @@ class FixedCharge < ApplicationRecord
 
     fixed_charge = plan.fixed_charges.parents.where(code:).first
     errors.add(:code, :taken) if fixed_charge && fixed_charge != self
+  end
+
+  # Model-level so no caller can bypass it: a catalog plan never carries chargeables.
+  def validate_plan_pricing_type
+    return unless plan&.product_catalog?
+
+    errors.add(:plan, :legacy_billing_disabled)
   end
 end
 

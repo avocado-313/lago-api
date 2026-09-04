@@ -2,6 +2,8 @@
 
 module Invoices
   class ComputeTaxesAndTotalsService < BaseService
+    Result = BaseResult[:invoice, :non_invoiceable_fees]
+
     def initialize(invoice:, finalizing: true)
       @invoice = invoice
       @finalizing = finalizing
@@ -34,8 +36,8 @@ module Invoices
     attr_reader :invoice, :finalizing
 
     def set_pending_tax_status!
-      invoice.status = "pending" if finalizing
-      invoice.tax_status = "pending"
+      invoice.status = (invoice.subscription_gated? ? :open : :pending) if finalizing
+      invoice.tax_status = :pending
       invoice.save!
     end
 

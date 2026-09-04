@@ -5,6 +5,10 @@ require "rails_helper"
 RSpec.describe UsageMonitoring::ProcessOrganizationSubscriptionActivitiesJob do
   let(:organization) { create(:organization) }
 
+  it_behaves_like "a configurable queue", "alerts", "SIDEKIQ_ALERTS" do
+    let(:arguments) { create(:organization).id }
+  end
+
   before do
     allow(UsageMonitoring::ProcessOrganizationSubscriptionActivitiesService).to receive(:call!)
   end
@@ -20,6 +24,22 @@ RSpec.describe UsageMonitoring::ProcessOrganizationSubscriptionActivitiesJob do
     it "does not call the service or log" do
       described_class.perform_now(organization.id)
       expect(UsageMonitoring::ProcessOrganizationSubscriptionActivitiesService).not_to have_received(:call!)
+    end
+  end
+
+  describe "queue routing" do
+    let(:other_organization) { create(:organization) }
+
+    before { stub_const("Utils::DedicatedWorkerConfig::ORGANIZATION_IDS", [organization.id]) }
+
+    it "routes to the dedicated queue for a targeted organization" do
+      job = described_class.new(organization.id)
+      expect(job.queue_name).to eq("dedicated_alerts")
+    end
+
+    it "falls back to the default queue for non-targeted organizations" do
+      job = described_class.new(other_organization.id)
+      expect(job.queue_name).to eq("default")
     end
   end
 end

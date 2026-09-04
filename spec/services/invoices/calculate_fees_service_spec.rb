@@ -119,7 +119,6 @@ RSpec.describe Invoices::CalculateFeesService do
     fixed_charge
     fixed_charge_event
 
-    allow(SegmentTrackJob).to receive(:perform_later)
     allow(Invoices::Payments::CreateService).to receive(:call_async).and_call_original
     allow(Credits::ProgressiveBillingService).to receive(:call).and_call_original
   end
@@ -153,6 +152,64 @@ RSpec.describe Invoices::CalculateFeesService do
         result = invoice_service.call
         expect(result).to be_success
         expect(Credits::ProgressiveBillingService).to have_received(:call).with(invoice:)
+      end
+
+      context "with adjusted fees existence query" do
+        let(:adjusted_fee) do
+          create(
+            :adjusted_fee,
+            invoice:,
+            subscription:,
+            charge:,
+            fee_type: :charge,
+            properties: {
+              charges_from_datetime: date_service.charges_from_datetime,
+              charges_to_datetime: date_service.charges_to_datetime
+            }
+          )
+        end
+
+        before do
+          allow(AdjustedFee).to receive(:matching_charge_boundaries).and_call_original
+          allow(Fees::ChargeService).to receive(:call!).and_call_original
+        end
+
+        context "when the invoice is a draft with an adjusted fee" do
+          before do
+            invoice.draft!
+            adjusted_fee
+          end
+
+          it "queries AdjustedFee and applies the adjusted fee" do
+            invoice_service.call
+
+            expect(AdjustedFee).to have_received(:matching_charge_boundaries)
+            expect(Fees::ChargeService).to have_received(:call!)
+              .with(hash_including(options: have_attributes(skip_adjusted_fees: false)))
+          end
+        end
+
+        context "when the invoice is a draft without an adjusted fee" do
+          before { invoice.draft! }
+
+          it "queries AdjustedFee only once and skips the per-charge lookup" do
+            invoice_service.call
+
+            expect(AdjustedFee).to have_received(:matching_charge_boundaries).once
+            expect(Fees::ChargeService).to have_received(:call!)
+              .with(hash_including(options: have_attributes(skip_adjusted_fees: true)))
+          end
+        end
+
+        context "when finalizing the invoice" do
+          let(:context) { :finalize }
+
+          it "queries AdjustedFee" do
+            invoice_service.call
+
+            expect(AdjustedFee).to have_received(:matching_charge_boundaries)
+          end
+        end
       end
 
       context "when a progressive_billing invoice is present" do
@@ -2359,6 +2416,25 @@ RSpec.describe Invoices::CalculateFeesService do
         expect(result).to be_success
         expect(result.invoice.fees.fixed_charge.count).to eq(0)
       end
+    end
+  end
+
+  context "when subscription is incomplete" do
+    let(:status) { :incomplete }
+    let(:timestamp) { Time.zone.parse("07 Mar 2022") }
+    let(:started_at) { Time.zone.parse("07 Mar 2022") }
+    let(:billing_time) { :anniversary }
+    let(:pay_in_advance) { true }
+    let(:fixed_charge) do
+      create(:fixed_charge, plan: subscription.plan, charge_model: "standard", properties: {amount: "10"}, units: 10, pay_in_advance: true)
+    end
+
+    it "creates subscription and fixed charge fees" do
+      result = invoice_service.call
+
+      expect(result).to be_success
+      expect(invoice.fees.subscription.count).to eq(1)
+      expect(invoice.fees.fixed_charge.count).to eq(1)
     end
   end
 

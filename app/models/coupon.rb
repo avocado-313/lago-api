@@ -49,7 +49,7 @@ class Coupon < ApplicationRecord
   monetize :amount_cents, disable_validation: true, allow_nil: true
 
   validates :name, presence: true
-  validates :code, uniqueness: {conditions: -> { where(deleted_at: nil) }, scope: :organization_id}
+  validates :code, presence: true, uniqueness: {conditions: -> { where(deleted_at: nil) }, scope: :organization_id}
 
   validates :amount_cents, presence: true, if: :fixed_amount?
   validates :amount_cents, numericality: {greater_than: 0}, allow_nil: true
@@ -58,6 +58,8 @@ class Coupon < ApplicationRecord
   validates :amount_currency, inclusion: {in: currency_list}, allow_nil: true
 
   validates :percentage_rate, presence: true, if: :percentage?
+
+  validates :frequency_duration, presence: true, numericality: {greater_than: 0}, if: :recurring?
 
   validates :reusable, exclusion: [nil]
 
@@ -99,7 +101,7 @@ end
 #  id                       :uuid             not null, primary key
 #  amount_cents             :bigint
 #  amount_currency          :string
-#  code                     :string
+#  code                     :string           not null
 #  coupon_type              :integer          default("fixed_amount"), not null
 #  deleted_at               :datetime
 #  description              :text

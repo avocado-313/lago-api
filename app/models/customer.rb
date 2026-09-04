@@ -8,6 +8,7 @@ class Customer < ApplicationRecord
   include OrganizationTimezone
   include BillingEntityTimezone
   include Discard::Model
+  include NullByteSanitizable
 
   self.discard_column = :deleted_at
 
@@ -37,6 +38,15 @@ class Customer < ApplicationRecord
     align_with_finalization_date: "align_with_finalization_date"
   }.freeze
 
+  SEARCHABLE_CUSTOMER_FIELDS = %w[
+    name
+    firstname
+    lastname
+    legal_name
+    external_id
+    email
+  ].freeze
+
   attribute :finalize_zero_amount_invoice, :integer
   enum :finalize_zero_amount_invoice, FINALIZE_ZERO_AMOUNT_INVOICE_OPTIONS, prefix: :finalize_zero_amount_invoice
   attribute :customer_type, :string
@@ -54,6 +64,7 @@ class Customer < ApplicationRecord
   belongs_to :applied_dunning_campaign, optional: true, class_name: "DunningCampaign"
 
   has_many :subscriptions
+  has_many :contracts
   has_many :events
   has_many :invoices
   has_many :applied_coupons
@@ -63,6 +74,9 @@ class Customer < ApplicationRecord
   has_many :applied_add_ons
   has_many :add_ons, through: :applied_add_ons
   has_many :daily_usages
+  has_many :quotes
+  has_many :order_forms
+  has_many :orders
   has_many :wallets
   has_many :wallet_transactions, through: :wallets
   has_many :payment_provider_customers,
@@ -144,6 +158,7 @@ class Customer < ApplicationRecord
   validates :country, :shipping_country, country_code: true, allow_nil: true
   validates :document_locale, language_code: true, unless: -> { document_locale.nil? }
   validates :currency, inclusion: {in: currency_list}, allow_nil: true
+  validates :name, length: {maximum: 255}, if: :name_changed?
   validates :external_id,
     presence: true,
     uniqueness: {conditions: -> { where(deleted_at: nil) }, scope: :organization_id},
@@ -165,10 +180,14 @@ class Customer < ApplicationRecord
 
   ADDRESS_FIELDS = (BILLING_ADDRESS_FIELDS + SHIPPING_ADDRESS_FIELDS).freeze
 
-  ADDRESS_FIELDS.each do |attribute|
-    # NOTE: Null byte injection. Prevent 500 errors.
-    normalizes attribute, with: ->(value) { value.delete("\u0000").presence }
-  end
+  # NOTE: Null byte injection. Prevent 500 errors (ArgumentError: string contains null byte).
+  # Address fields keep the historical blank -> nil behavior; identity/free-text
+  # fields are only stripped so existing empty-string values are preserved.
+  sanitize_null_bytes(*ADDRESS_FIELDS, blank_to_nil: true)
+  sanitize_null_bytes :name, :firstname, :lastname, :legal_name, :legal_number,
+    :phone, :url, :logo_url, :tax_identification_number
+
+  normalizes :email, with: ->(email) { EmailSanitizer.call(email) }
 
   def self.ransackable_attributes(_auth_object = nil)
     %w[id name firstname lastname legal_name external_id email]
@@ -289,6 +308,17 @@ class Customer < ApplicationRecord
     }
   end
 
+  def effective_shipping_address
+    {
+      address_line1: shipping_address_line1.presence || address_line1,
+      address_line2: shipping_address_line2.presence || address_line2,
+      city: shipping_city.presence || city,
+      zipcode: shipping_zipcode.presence || zipcode,
+      state: shipping_state.presence || state,
+      country: shipping_country.presence || country
+    }
+  end
+
   def same_billing_and_shipping_address?
     return true if shipping_address.values.all?(&:blank?)
 
@@ -310,14 +340,31 @@ class Customer < ApplicationRecord
       country.blank?
   end
 
-  def overdue_balance_cents
-    invoices.non_self_billed.payment_overdue.where(currency:).sum(:total_amount_cents)
+  def overdue_balance_cents(for_currency = currency)
+    invoices.non_self_billed.payment_overdue.where(currency: for_currency).sum(:total_amount_cents)
+  end
+
+  def overdue_balances
+    invoices.non_self_billed.payment_overdue
+      .group(:currency).sum(:total_amount_cents)
   end
 
   def reset_dunning_campaign!
     update!(
+      dunning_currency_attempts: {},
       last_dunning_campaign_attempt: 0,
       last_dunning_campaign_attempt_at: nil
+    )
+  end
+
+  def reset_dunning_campaign_for_currency!(currency)
+    attempts = dunning_currency_attempts.dup
+    attempts[currency.to_s] = 0
+    all_reset = attempts.values.all?(&:zero?)
+    update!(
+      dunning_currency_attempts: attempts,
+      last_dunning_campaign_attempt: 0,
+      last_dunning_campaign_attempt_at: (all_reset ? nil : last_dunning_campaign_attempt_at)
     )
   end
 
@@ -329,6 +376,24 @@ class Customer < ApplicationRecord
 
   def tax_customer
     anrok_customer || avalara_customer
+  end
+
+  def payment_connection(code = nil)
+    return payment_provider_customers.by_code(code).first if code.present?
+
+    payment_provider_customers.find_by(is_default: true)
+  end
+
+  def payment_connection_status
+    connection = payment_connection
+
+    if connection.nil?
+      PaymentProviderCustomers::BaseCustomer::CONNECTION_STATUSES[:not_connected]
+    elsif connection.manual?
+      PaymentProviderCustomers::BaseCustomer::CONNECTION_STATUSES[:manual]
+    else
+      PaymentProviderCustomers::BaseCustomer::CONNECTION_STATUSES[:connected]
+    end
   end
 
   def address_changed?
@@ -362,6 +427,7 @@ end
 #  customer_type                                :enum
 #  deleted_at                                   :datetime
 #  document_locale                              :string
+#  dunning_currency_attempts                    :jsonb            not null
 #  email                                        :string
 #  exclude_from_dunning_campaign                :boolean          default(FALSE), not null
 #  finalize_zero_amount_invoice                 :integer          default("inherit"), not null
@@ -378,6 +444,7 @@ end
 #  payment_provider                             :string
 #  payment_provider_code                        :string
 #  payment_receipt_counter                      :bigint           default(0), not null
+#  payment_term                                 :jsonb
 #  phone                                        :string
 #  shipping_address_line1                       :string
 #  shipping_address_line2                       :string
@@ -406,15 +473,23 @@ end
 #
 # Indexes
 #
-#  index_customers_on_account_type                     (account_type)
-#  index_customers_on_applied_dunning_campaign_id      (applied_dunning_campaign_id)
-#  index_customers_on_awaiting_wallet_refresh          (awaiting_wallet_refresh)
-#  index_customers_on_billing_entity_id                (billing_entity_id)
-#  index_customers_on_deleted_at                       (deleted_at)
-#  index_customers_on_external_id                      (organization_id,external_id)
-#  index_customers_on_external_id_and_organization_id  (external_id,organization_id) UNIQUE WHERE (deleted_at IS NULL)
-#  index_customers_on_org_id_and_sequential_id_unique  (organization_id,sequential_id) UNIQUE WHERE (sequential_id IS NOT NULL)
-#  index_customers_on_sequential_id                    (sequential_id)
+#  index_customers_by_cursor                                    (organization_id,created_at DESC,id)
+#  index_customers_on_account_type                              (account_type)
+#  index_customers_on_applied_dunning_campaign_id               (applied_dunning_campaign_id)
+#  index_customers_on_awaiting_wallet_refresh                   (awaiting_wallet_refresh)
+#  index_customers_on_billing_entity_id                         (billing_entity_id)
+#  index_customers_on_deleted_at                                (deleted_at)
+#  index_customers_on_external_id                               (organization_id,external_id)
+#  index_customers_on_external_id_and_organization_id           (external_id,organization_id) UNIQUE WHERE (deleted_at IS NULL)
+#  index_customers_on_org_id_and_sequential_id_unique           (organization_id,sequential_id) UNIQUE WHERE (sequential_id IS NOT NULL)
+#  index_customers_on_organization_id_email_gin_trgm_ops        (organization_id,email) WHERE (deleted_at IS NULL) USING gin
+#  index_customers_on_organization_id_external_id_gin_trgm_ops  (organization_id,external_id) WHERE (deleted_at IS NULL) USING gin
+#  index_customers_on_organization_id_firstname_gin_trgm_ops    (organization_id,firstname) WHERE (deleted_at IS NULL) USING gin
+#  index_customers_on_organization_id_kept                      (organization_id) WHERE (deleted_at IS NULL)
+#  index_customers_on_organization_id_lastname_gin_trgm_ops     (organization_id,lastname) WHERE (deleted_at IS NULL) USING gin
+#  index_customers_on_organization_id_legal_name_gin_trgm_ops   (organization_id,legal_name) WHERE (deleted_at IS NULL) USING gin
+#  index_customers_on_organization_id_name_gin_trgm_ops         (organization_id,name) WHERE (deleted_at IS NULL) USING gin
+#  index_customers_on_sequential_id                             (sequential_id)
 #
 # Foreign Keys
 #

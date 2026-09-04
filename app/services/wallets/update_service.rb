@@ -19,16 +19,26 @@ module Wallets
 
     def call
       return result.not_found_failure!(resource: "wallet") unless wallet
+      return result.single_validation_failure!(field: :wallet_id, error_code: "wallet_is_terminated") if wallet.terminated?
       return result unless valid_expiration_at?(expiration_at: params[:expiration_at])
       return result unless valid_recurring_transaction_rules?
       return result unless valid_limitations?
       return result unless valid_payment_method?
+
+      if billing_entity_param_sent?
+        if billing_entity_value_provided? && billing_entity.nil?
+          return result.not_found_failure!(resource: "billing_entity")
+        end
+
+        wallet.billing_entity = billing_entity
+      end
 
       ActiveRecord::Base.transaction do
         wallet.name = params[:name] if params.key?(:name)
         wallet.code = params[:code] if params[:code]
         wallet.priority = params[:priority] if params[:priority]
         wallet.expiration_at = params[:expiration_at] if params.key?(:expiration_at)
+        wallet.purchase_order_number = params[:purchase_order_number] if params.key?(:purchase_order_number)
         unless params[:invoice_requires_successful_payment].nil?
           wallet.invoice_requires_successful_payment = ActiveModel::Type::Boolean.new.cast(params[:invoice_requires_successful_payment])
         end
@@ -38,7 +48,14 @@ module Wallets
           Wallets::RecurringTransactionRules::UpdateService.call!(wallet:, params: params[:recurring_transaction_rules])
         end
 
-        wallet.recurring_transaction_rules.find_each { |rule| validate_rule!(rule:) }
+        # NOTE: validate through the .active scope (fresh query) rather than
+        # the bare association: the activity-log middleware serializes the
+        # wallet BEFORE the update, caching recurring_transaction_rules with
+        # their pre-update values — iterating the cached target validated the
+        # STALE rule against the freshly assigned min/max bounds (false
+        # invalid_recurring_rule) and never the values just written. The scope
+        # also skips terminated rules, which must not block the update.
+        wallet.recurring_transaction_rules.active.find_each { |rule| validate_rule!(rule:) }
 
         if params.key?(:applies_to)
           wallet.allowed_fee_types = params[:applies_to][:fee_types] if params[:applies_to].key?(:fee_types)
@@ -54,11 +71,15 @@ module Wallets
         wallet.save!
 
         update_metadata!
-      end
 
-      InvoiceCustomSections::AttachToResourceService.call(resource: wallet, params:)
-      SendWebhookJob.perform_later("wallet.updated", wallet)
-      Customers::RefreshWalletsService.call(customer: wallet.customer)
+        if needs_refresh?
+          wallet.customer.flag_wallets_for_refresh
+          Customers::RefreshWalletJob.perform_after_commit(wallet.customer)
+        end
+
+        InvoiceCustomSections::AttachToResourceService.call!(resource: wallet, params:)
+        SendWebhookJob.perform_after_commit("wallet.updated", wallet)
+      end
 
       result.wallet = wallet
       result
@@ -121,6 +142,7 @@ module Wallets
         next if existing_wallet_billable_metric_ids.include?(bm.id)
 
         WalletTarget.create!(wallet:, billable_metric: bm, organization_id: wallet.organization_id)
+        @wallet_targets_changed = true
       end
 
       sanitize_wallet_billable_metrics(existing_wallet_billable_metric_ids) if existing_wallet_billable_metric_ids.present?
@@ -129,8 +151,18 @@ module Wallets
     def sanitize_wallet_billable_metrics(existing_wallet_billable_metric_ids)
       not_needed_wallet_target_ids = existing_wallet_billable_metric_ids - billable_metrics.pluck(:id)
       not_needed_wallet_target_ids.each do |wallet_billable_metric_id|
-        WalletTarget.find_by(wallet:, billable_metric_id: wallet_billable_metric_id, organization: wallet.organization)&.destroy!
+        target = WalletTarget.find_by(wallet:, billable_metric_id: wallet_billable_metric_id, organization: wallet.organization)
+        next unless target
+
+        target.destroy!
+        @wallet_targets_changed = true
       end
+    end
+
+    def needs_refresh?
+      return true if @wallet_targets_changed
+
+      (wallet.saved_changes.keys & Wallet::REFRESH_RELEVANT_ATTRIBUTES).any?
     end
 
     def billable_metric_identifiers
@@ -165,6 +197,29 @@ module Wallets
       return unless params.key?(:metadata)
 
       Metadata::UpdateItemService.call!(owner: wallet, value: params[:metadata], partial: partial_metadata.present?)
+    end
+
+    def organization_flag_enabled?(flag)
+      wallet.customer.organization.feature_flag_enabled?(flag)
+    end
+
+    def billing_entity_param_sent?
+      params.key?(:billing_entity_id) || params.key?(:billing_entity_code)
+    end
+
+    def billing_entity_value_provided?
+      params[:billing_entity_id].present? || params[:billing_entity_code].present?
+    end
+
+    def billing_entity
+      return @billing_entity if defined? @billing_entity
+
+      scope = wallet.customer.organization.billing_entities
+      @billing_entity = if params[:billing_entity_id].present?
+        scope.find_by(id: params[:billing_entity_id])
+      elsif params[:billing_entity_code].present?
+        scope.find_by(code: params[:billing_entity_code])
+      end
     end
   end
 end

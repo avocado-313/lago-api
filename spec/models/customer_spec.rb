@@ -18,6 +18,8 @@ RSpec.describe Customer do
   it { is_expected.to have_many(:payment_methods) }
   it { is_expected.to have_many(:payment_requests) }
   it { is_expected.to have_many(:error_details).dependent(:destroy) }
+  it { is_expected.to have_many(:order_forms) }
+  it { is_expected.to have_many(:orders) }
 
   it { is_expected.to have_one(:netsuite_customer) }
   it { is_expected.to have_one(:anrok_customer) }
@@ -82,11 +84,43 @@ RSpec.describe Customer do
         expect(described_class.normalize_value_for(field, "")).to be_nil
       end
     end
+
+    it "strips null bytes from identity and free-text attributes" do
+      normalized_customer = build(
+        :customer,
+        name: "Foo\u0000Bar",
+        firstname: "Jo\u0000hn",
+        lastname: "Do\u0000e",
+        legal_name: "Foo\u0000Corp",
+        legal_number: "12\u000034",
+        phone: "555\u00000199",
+        url: "https://ex\u0000ample.test",
+        logo_url: "https://ex\u0000ample.test/l.png",
+        tax_identification_number: "FR\u000012345"
+      )
+
+      expect(normalized_customer.name).to eq("FooBar")
+      expect(normalized_customer.firstname).to eq("John")
+      expect(normalized_customer.lastname).to eq("Doe")
+      expect(normalized_customer.legal_name).to eq("FooCorp")
+      expect(normalized_customer.legal_number).to eq("1234")
+      expect(normalized_customer.phone).to eq("5550199")
+      expect(normalized_customer.url).to eq("https://example.test")
+      expect(normalized_customer.logo_url).to eq("https://example.test/l.png")
+      expect(normalized_customer.tax_identification_number).to eq("FR12345")
+    end
+
+    it "keeps empty identity values as empty strings (not nil)" do
+      normalized_customer = build(:customer, firstname: "\u0000", lastname: "\u0000")
+
+      expect(normalized_customer.firstname).to eq("")
+      expect(normalized_customer.lastname).to eq("")
+    end
   end
 
   describe "validations" do
     subject(:customer) do
-      described_class.new(organization:, external_id:)
+      described_class.new(organization:, external_id:, billing_entity:)
     end
 
     let(:external_id) { SecureRandom.uuid }
@@ -116,6 +150,21 @@ RSpec.describe Customer do
 
       customer.timezone = "America/Guadeloupe"
       expect(customer).not_to be_valid
+    end
+
+    it "validates the name length" do
+      customer.name = "a" * 255
+      expect(customer).to be_valid
+
+      customer.name = "a" * 256
+      expect(customer).not_to be_valid
+    end
+
+    it "does not validate the name length when the name is unchanged" do
+      customer.save
+      customer.update_column(:name, "a" * 256) # rubocop:disable Rails/SkipsModelValidations
+      customer.timezone = "Europe/Paris"
+      expect(customer).to be_valid
     end
 
     describe "of email" do
@@ -1052,6 +1101,85 @@ RSpec.describe Customer do
     end
   end
 
+  describe "#effective_shipping_address" do
+    subject(:effective_shipping_address) { customer.effective_shipping_address }
+
+    let(:billing) do
+      {
+        address_line1: "Billing 1",
+        address_line2: "Billing 2",
+        city: "Billing City",
+        zipcode: "11111",
+        state: "Billing State",
+        country: "FR"
+      }
+    end
+
+    context "when shipping fields are all populated" do
+      let(:customer) { build_stubbed(:customer, :with_shipping_address, **billing) }
+
+      it "returns shipping values" do
+        expect(subject).to eq(
+          address_line1: customer.shipping_address_line1,
+          address_line2: customer.shipping_address_line2,
+          city: customer.shipping_city,
+          zipcode: customer.shipping_zipcode,
+          state: customer.shipping_state,
+          country: customer.shipping_country
+        )
+      end
+    end
+
+    context "when shipping fields are all nil" do
+      let(:customer) { build_stubbed(:customer, **billing) }
+
+      it "falls back to billing values for every field" do
+        expect(subject).to eq(billing)
+      end
+    end
+
+    context "when shipping fields are blank strings" do
+      let(:customer) do
+        build_stubbed(
+          :customer,
+          **billing,
+          shipping_address_line1: "",
+          shipping_address_line2: "",
+          shipping_city: "",
+          shipping_zipcode: "",
+          shipping_state: "",
+          shipping_country: ""
+        )
+      end
+
+      it "falls back to billing values for every field" do
+        expect(subject).to eq(billing)
+      end
+    end
+
+    context "when only some shipping fields are present" do
+      let(:customer) do
+        build_stubbed(
+          :customer,
+          **billing,
+          shipping_address_line1: "Shipping 1",
+          shipping_city: "Shipping City"
+        )
+      end
+
+      it "falls back per-field" do
+        expect(subject).to eq(
+          address_line1: "Shipping 1",
+          address_line2: "Billing 2",
+          city: "Shipping City",
+          zipcode: "11111",
+          state: "Billing State",
+          country: "FR"
+        )
+      end
+    end
+  end
+
   describe "#overdue_balance_cents" do
     subject(:overdue_balance_cents) { customer.overdue_balance_cents }
 
@@ -1106,6 +1234,63 @@ RSpec.describe Customer do
         expect(customer.overdue_balance_cents).to eq 2_00
       end
     end
+
+    context "when an explicit currency parameter is provided" do
+      before do
+        create(:invoice, customer: customer, payment_overdue: true, currency: "USD", total_amount_cents: 4_00)
+        create(:invoice, customer: customer, payment_overdue: true, currency: "EUR", total_amount_cents: 7_00)
+      end
+
+      it "returns overdue balance for the specified currency" do
+        expect(customer.overdue_balance_cents("EUR")).to eq 7_00
+        expect(customer.overdue_balance_cents("USD")).to eq 4_00
+      end
+    end
+  end
+
+  describe "#overdue_balances" do
+    let(:customer) { create(:customer, currency: "USD") }
+
+    context "when there are no overdue invoices" do
+      it "returns an empty hash" do
+        expect(customer.overdue_balances).to eq({})
+      end
+    end
+
+    context "when there are overdue invoices in multiple currencies" do
+      before do
+        create(:invoice, customer: customer, payment_overdue: true, currency: "USD", total_amount_cents: 2_00)
+        create(:invoice, customer: customer, payment_overdue: true, currency: "USD", total_amount_cents: 3_00)
+        create(:invoice, customer: customer, payment_overdue: true, currency: "EUR", total_amount_cents: 10_00)
+      end
+
+      it "returns per-currency breakdown" do
+        expect(customer.overdue_balances).to eq("USD" => 5_00, "EUR" => 10_00)
+      end
+    end
+
+    context "when customer have paid and overdue invoices" do
+      before do
+        create(:invoice, customer: customer, payment_overdue: true, currency: "USD", total_amount_cents: 2_00)
+        create(:invoice, customer: customer, payment_overdue: false, currency: "USD", total_amount_cents: 5_00)
+        create(:invoice, customer: customer, payment_overdue: false, currency: "EUR", total_amount_cents: 8_00)
+      end
+
+      it "only includes overdue invoices" do
+        expect(customer.overdue_balances).to eq("USD" => 2_00)
+      end
+    end
+
+    context "when invoices are self billed" do
+      before do
+        create(:invoice, customer: customer, payment_overdue: true, currency: "USD", total_amount_cents: 2_00)
+        create(:invoice, :self_billed, customer: customer, payment_overdue: true, currency: "USD", total_amount_cents: 3_00)
+      end
+
+      it "ignores self billed invoices" do
+        expect(customer.overdue_balances).to eq("USD" => 2_00)
+      end
+    end
   end
 
   describe "#reset_dunning_campaign!" do
@@ -1113,7 +1298,8 @@ RSpec.describe Customer do
       create(
         :customer,
         last_dunning_campaign_attempt: 5,
-        last_dunning_campaign_attempt_at: 1.day.ago
+        last_dunning_campaign_attempt_at: 1.day.ago,
+        dunning_currency_attempts: {"EUR" => 3, "USD" => 2}
       )
     end
 
@@ -1121,6 +1307,48 @@ RSpec.describe Customer do
       expect { customer.reset_dunning_campaign! && customer.reload }
         .to change(customer, :last_dunning_campaign_attempt).to(0)
         .and change(customer, :last_dunning_campaign_attempt_at).to(nil)
+        .and change(customer, :dunning_currency_attempts).to({})
+    end
+  end
+
+  describe "#reset_dunning_campaign_for_currency!" do
+    let(:last_dunning_campaign_attempt_at) { 1.day.ago }
+    let(:customer) do
+      create(
+        :customer,
+        last_dunning_campaign_attempt: 5,
+        last_dunning_campaign_attempt_at:,
+        dunning_currency_attempts: {"EUR" => 3, "USD" => 2}
+      )
+    end
+
+    it "resets only the specified currency to zero and keeps others" do
+      expect { customer.reset_dunning_campaign_for_currency!("EUR") && customer.reload }
+        .to change(customer, :dunning_currency_attempts).to({"EUR" => 0, "USD" => 2})
+        .and change(customer, :last_dunning_campaign_attempt).to(0)
+    end
+
+    it "preserves last_dunning_campaign_attempt_at when other currencies are active" do
+      customer.reset_dunning_campaign_for_currency!("EUR")
+      customer.reload
+      expect(customer.last_dunning_campaign_attempt_at).to be_within(1.second).of(last_dunning_campaign_attempt_at)
+    end
+
+    context "when all currencies are reset to zero" do
+      let(:customer) do
+        create(
+          :customer,
+          last_dunning_campaign_attempt: 5,
+          last_dunning_campaign_attempt_at:,
+          dunning_currency_attempts: {"EUR" => 3}
+        )
+      end
+
+      it "clears the timestamp so dunning can restart immediately" do
+        expect { customer.reset_dunning_campaign_for_currency!("EUR") && customer.reload }
+          .to change(customer, :dunning_currency_attempts).to({"EUR" => 0})
+          .and change(customer, :last_dunning_campaign_attempt_at).to(nil)
+      end
     end
   end
 
@@ -1194,6 +1422,58 @@ RSpec.describe Customer do
     context "without any tax integration" do
       it "returns nil" do
         expect(customer.tax_customer).to eq(nil)
+      end
+    end
+  end
+
+  describe "#payment_connection" do
+    let(:customer) { create(:customer) }
+    let!(:default_connection) { create(:stripe_customer, customer:, code: "stripe_eu", is_default: true) }
+    let!(:other_connection) { create(:gocardless_customer, customer:, code: "gc") }
+
+    it "returns the default connection when no code is given" do
+      expect(customer.payment_connection).to eq(default_connection)
+    end
+
+    it "returns the connection matching the given code" do
+      expect(customer.payment_connection("gc")).to eq(other_connection)
+    end
+
+    it "returns nil for an unknown code" do
+      expect(customer.payment_connection("unknown")).to be_nil
+    end
+  end
+
+  describe "#payment_connection_status" do
+    let(:customer) { create(:customer) }
+
+    context "when no connection is the default" do
+      it "returns not_connected" do
+        expect(customer.payment_connection_status).to eq("not_connected")
+      end
+    end
+
+    context "when the default is a provider connection" do
+      before { create(:stripe_customer, customer:, is_default: true) }
+
+      it "returns connected" do
+        expect(customer.payment_connection_status).to eq("connected")
+      end
+    end
+
+    context "when the default is the manual row" do
+      before do
+        PaymentProviderCustomers::BaseCustomer.create!(
+          customer:,
+          organization: customer.organization,
+          type: "PaymentProviderCustomers::BaseCustomer",
+          code: "lago_manual",
+          is_default: true
+        )
+      end
+
+      it "returns manual" do
+        expect(customer.payment_connection_status).to eq("manual")
       end
     end
   end

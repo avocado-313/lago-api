@@ -2,6 +2,8 @@
 
 module Invoices
   class UpdateService < BaseService
+    Result = BaseResult[:invoice]
+
     def initialize(invoice:, params:, webhook_notification: false)
       @invoice = invoice
       @params = params
@@ -48,7 +50,7 @@ module Invoices
           invoice.payment_overdue = false
 
           if invoice.payment_requests.where.not(dunning_campaign_id: nil).exists?
-            invoice.customer.reset_dunning_campaign!
+            invoice.customer.reset_dunning_campaign_for_currency!(invoice.currency)
           end
         end
 
@@ -72,13 +74,24 @@ module Invoices
     def schedule_post_processing_jobs(old_payment_status)
       if params.key?(:payment_status)
         handle_prepaid_credits(params[:payment_status])
+        handle_payment_gated_activation(params[:payment_status])
         update_fees_payment_status
+        expire_open_checkout_urls(old_payment_status)
         if old_payment_status != params[:payment_status] && invoice.visible?
           deliver_webhook
           log_activity
         end
       end
       update_hubspot_invoice if invoice.should_update_hubspot_invoice?
+    end
+
+    # when the invoice is settled, cancel any still-open hosted checkout session
+    def expire_open_checkout_urls(old_payment_status)
+      return unless invoice.payment_succeeded?
+      return if old_payment_status.to_s == "succeeded"
+      return unless PaymentIntent.active.exists?(invoice:)
+
+      PaymentIntents::ExpireJob.perform_after_commit(invoice)
     end
 
     def update_fees_payment_status
@@ -102,6 +115,17 @@ module Invoices
       return unless %i[succeeded failed].include?(payment_status.to_sym)
 
       Invoices::PrepaidCreditJob.perform_after_commit(invoice, payment_status.to_sym)
+    end
+
+    def handle_payment_gated_activation(payment_status)
+      return unless invoice.subscription_gated?
+      return unless %i[succeeded failed].include?(payment_status.to_sym)
+
+      subscription = invoice.subscriptions.find(&:incomplete?)
+      return unless subscription
+
+      Subscriptions::ActivationRules::Payment::ResolveJob
+        .perform_after_commit(subscription, invoice, payment_status.to_sym)
     end
 
     def valid_metadata_count?(metadata:)

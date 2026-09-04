@@ -10,14 +10,19 @@ module Events
       # processed on the events processor side
       CLICKHOUSE_MERGE_DELAY = 15.seconds
 
+      DEDUP_KEY_COLUMNS = %w[code organization_id external_subscription_id transaction_id timestamp].freeze
+
       def events(force_from: false, ordered: false)
         Events::Stores::Utils::ClickhouseConnection.with_retry do
           scope = if deduplicate
+            events_from = (from_datetime if force_from || use_from_boundary)
+            events_to = (applicable_to_datetime if applicable_to_datetime)
+
             deduplicated_subquery = deduplicated_events_sql(
-              from_datetime: (from_datetime if force_from || use_from_boundary),
-              to_datetime: (applicable_to_datetime if applicable_to_datetime),
+              from_datetime: events_from,
+              to_datetime: events_to,
               deduplicated_columns: %w[value decimal_value properties precise_total_amount_cents]
-            ).to_sql
+            )
 
             ::Clickhouse::EventsEnriched.from("(#{deduplicated_subquery}) AS events_enriched")
           else
@@ -27,7 +32,7 @@ module Events
               .where(code:)
 
             query = query.where("events_enriched.timestamp >= ?", from_datetime) if force_from || use_from_boundary
-            query = query.where("events_enriched.timestamp <= ?", applicable_to_datetime) if applicable_to_datetime
+            query = query.where(upper_timestamp_boundary_sql(applicable_to_datetime, prefix: "events_enriched.")) if applicable_to_datetime
             query
           end
 
@@ -69,11 +74,8 @@ module Events
         order_column = deduplicated_columns.include?("decimal_value") ? "decimal_value" : "value"
         deduplicated_columns << order_column if ordered
 
-        base_sql = deduplicated_events_sql(
-          from_datetime: (from_datetime if force_from || use_from_boundary),
-          to_datetime: (applicable_to_datetime if applicable_to_datetime),
-          deduplicated_columns:
-        ).to_sql
+        events_from = (from_datetime if force_from || use_from_boundary)
+        events_to = (applicable_to_datetime if applicable_to_datetime)
 
         query = arel_table
         query = query.order(arel_table[:timestamp].desc, arel_table[order_column]) if ordered
@@ -82,27 +84,19 @@ module Events
         query = arel_filters_scope(query)
 
         {
-          "events_enriched" => base_sql, # Override events table name with deduplicated events
+          "events_enriched" => deduplicated_events_sql(from_datetime: events_from, to_datetime: events_to, deduplicated_columns:),
           "events" => query.project(select).to_sql
         }
       end
 
-      # Clickhouse cannot garanty that events_enriched will be deduplicated all the time
-      # To address this problem, we have to implement deduplication at query time.
-      # This is done by grouping events on transaction_id and timestamp (unicity key) and
-      # by using `argMax` function, to keep only the most recent event of each group
+      # ClickHouse cannot guarantee that events_enriched will be deduplicated all the time,
+      # so we deduplicate at query time with the `FINAL` modifier: the ReplacingMergeTree
+      # engine collapses the rows sharing the same sorting key at read time, keeping the
+      # row from the most recent part (the latest enrichment).
+      # This replaces a previous two-pass implementation (`GROUP BY` the dedup key +
+      # `INNER ANY JOIN`) which was dominating the ClickHouse cluster CPU, and an even
+      # earlier `argMax` version which caused ClickHouse OOM on large subscriptions.
       def deduplicated_events_sql(from_datetime:, to_datetime:, deduplicated_columns: [])
-        query = arel_table.where(
-          arel_table[:external_subscription_id].eq(subscription.external_id)
-          .and(arel_table[:organization_id].eq(subscription.organization.id)
-          .and(arel_table[:code].eq(code)))
-        ).then { with_timestamp_boundaries(it, from_datetime, to_datetime) }
-
-        # Push property filters BEFORE GROUP BY so ClickHouse filters first,
-        # then deduplicates only relevant rows (significant memory/CPU savings).
-        query = arel_filters_scope(query)
-        query = apply_arel_grouped_by_values(query) if grouped_by_values?
-
         columns = deduplicated_columns.dup
 
         # Grouping and filtering is made based on the properties
@@ -110,46 +104,80 @@ module Events
           columns << "properties"
         end
 
-        arel_columns = columns.uniq.map do
-          Arel::Nodes::NamedFunction.new("argMax", [arel_table[it.to_sym], arel_table[:enriched_at]]).as(it)
-        end
+        selected_columns = (DEDUP_KEY_COLUMNS + columns).uniq.join(", ")
 
-        query = query.group(
-          arel_table[:code],
-          arel_table[:organization_id],
-          arel_table[:external_subscription_id],
-          arel_table[:timestamp],
-          arel_table[:transaction_id]
-        )
-        query.project(
-          [
-            arel_table[:code],
-            arel_table[:organization_id],
-            arel_table[:external_subscription_id],
-            arel_table[:transaction_id],
-            arel_table[:timestamp]
-          ] + arel_columns
-        )
+        <<~SQL.squish
+          SELECT #{selected_columns}
+          FROM events_enriched FINAL
+          WHERE #{deduplicated_events_where_sql(from_datetime:, to_datetime:)}
+        SQL
       end
 
-      def distinct_codes
-        Events::Stores::Utils::ClickhouseConnection.with_retry do
-          ::Clickhouse::EventsEnriched
-            .where(external_subscription_id: subscription.external_id)
-            .where(organization_id: subscription.organization.id)
-            .where("events_enriched.timestamp >= ?", from_datetime)
-            .where("events_enriched.timestamp <= ?", applicable_to_datetime)
-            .pluck("DISTINCT(code)")
-        end
+      def deduplicated_events_where_sql(from_datetime:, to_datetime:)
+        conditions = [
+          ActiveRecord::Base.sanitize_sql_for_conditions(
+            [
+              "organization_id = ? AND code = ? AND external_subscription_id = ?",
+              subscription.organization_id,
+              code,
+              subscription.external_id
+            ]
+          )
+        ]
+
+        conditions << ActiveRecord::Base.sanitize_sql_for_conditions(["timestamp >= ?", from_datetime]) if from_datetime
+        conditions << upper_timestamp_boundary_sql(to_datetime) if to_datetime
+        conditions.join(" AND ")
       end
 
-      def distinct_charges_and_filters
+      def distinct_charges_and_filters(codes: nil, include_all_history: false, with_last_seen_at: true)
         # Implementation relies directly on the events_enriched_expanded table,
         # so we delegate the implementation to the ClickhouseEnrichedStore
         Events::Stores::ClickhouseEnrichedStore.new(
           subscription:,
           boundaries:
-        ).distinct_charges_and_filters
+        ).distinct_charges_and_filters(codes:, include_all_history:, with_last_seen_at:)
+      end
+
+      # Returns the distinct [code, properties, last_seen_at] combinations present in the events
+      # of the period. Only properties present in the filter_keys are considered, so the result
+      # holds only the dimensions that can be matched against charge filters.
+      # An empty hash represents the default (no filter) bucket.
+      # last_seen_at is the enriched_at of the most recent event in the combination. With
+      # with_last_seen_at disabled the aggregate is not computed and last_seen_at is nil, which
+      # callers that never read it use to avoid scanning the column (see BillingPeriodFilterService).
+      #
+      # ClickHouse stores properties as a Map(String, String); a missing key reads back as an
+      # empty string, so blank values are dropped to mirror the Postgres jsonb behaviour.
+      def distinct_codes_and_property_combinations(codes:, filter_keys:, include_all_history: false, with_last_seen_at: true)
+        return [] if codes.empty?
+
+        Events::Stores::Utils::ClickhouseConnection.with_retry do
+          scope = ::Clickhouse::EventsEnriched
+            .where(external_subscription_id: subscription.external_id)
+            .where(organization_id: subscription.organization_id)
+            .where(code: codes)
+            .where("events_enriched.timestamp <= ?", applicable_to_datetime)
+          scope = scope.where("events_enriched.timestamp >= ?", from_datetime) unless include_all_history
+
+          selects = ["code AS code"]
+          group_columns = ["code"]
+          filter_keys.each_with_index do |key, index|
+            selects << ActiveRecord::Base.sanitize_sql_array(["properties[?] AS prop_#{index}", key.to_s])
+            group_columns << "prop_#{index}"
+          end
+          selects << (with_last_seen_at ? "MAX(enriched_at) AS last_seen_at" : "NULL AS last_seen_at")
+
+          scope.select(selects.join(", ")).group(group_columns.join(", ")).map do |row|
+            combination = {}
+            filter_keys.each_with_index do |key, index|
+              value = row.read_attribute("prop_#{index}")
+              combination[key] = value if value.present?
+            end
+
+            [row.code, combination, row.read_attribute("last_seen_at")]
+          end
+        end
       end
 
       def events_values(limit: nil, force_from: false, exclude_event: false)
@@ -200,18 +228,41 @@ module Events
       end
 
       def count
-        Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
-          sql = with_ctes(events_cte_queries(deduplicated_columns: %w[value]), <<-SQL)
+        value = Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
+          connection.select_value(count_query).to_i
+        end
+
+        build_aggregation_result_from_value(value)
+      end
+
+      # Counting deduplicated events only needs the number of distinct dedup keys,
+      # so we count directly on the deduplicated table without materializing any
+      # other column.
+      #
+      # When the count is filtered (grouped_by_values or matching/ignored filters)
+      # we keep the CTE-based path so the filter still applies to the deduplicated
+      # rows (identical semantics).
+      def count_query
+        filtered = grouped_by_values? || matching_filters.present? || ignored_filters.present?
+
+        if !deduplicate || filtered
+          return with_ctes(events_cte_queries(deduplicated_columns: %w[value]), <<-SQL)
             SELECT count()
             FROM events
           SQL
-
-          connection.select_value(sql).to_i
         end
+
+        events_from = (from_datetime if use_from_boundary)
+
+        <<~SQL.squish
+          SELECT count()
+          FROM events_enriched FINAL
+          WHERE #{deduplicated_events_where_sql(from_datetime: events_from, to_datetime: applicable_to_datetime)}
+        SQL
       end
 
-      def grouped_count
-        groups, group_names = grouped_arel_columns
+      def grouped_count(columns = grouped_by)
+        groups, column_names = grouped_arel_columns(columns)
 
         Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
           ctes_sql = events_cte_queries(
@@ -221,13 +272,13 @@ module Events
 
           sql = with_ctes(ctes_sql, <<-SQL)
             SELECT
-              #{group_names},
+              #{column_names},
               toDecimal32(count(), 0)
             FROM events
-            GROUP BY #{group_names}
+            GROUP BY #{column_names}
           SQL
 
-          prepare_grouped_result(connection.select_all(sql).rows)
+          grouped_results_with_value_as_count(prepare_grouped_result(connection.select_all(sql).rows, columns: columns))
         end
       end
 
@@ -260,7 +311,7 @@ module Events
           connection.select_one(sql)
         end
 
-        result["aggregation"]
+        build_aggregation_result_from_value(result["aggregation"])
       end
 
       # NOTE: not used in production, only for debug purpose to check the computed values before aggregation
@@ -296,7 +347,7 @@ module Events
           connection.select_one(sql)
         end
 
-        result["aggregation"]
+        build_aggregation_result_from_value(result["aggregation"])
       end
 
       def prorated_unique_count_breakdown(with_remove: false)
@@ -318,9 +369,12 @@ module Events
         end
       end
 
-      def grouped_unique_count
+      def grouped_unique_count(columns = grouped_by)
+        duplicated_unique_count_store = dup
+        duplicated_unique_count_store.grouped_by = columns
+
         Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
-          query = Events::Stores::Clickhouse::UniqueCountQuery.new(store: self)
+          query = Events::Stores::Clickhouse::UniqueCountQuery.new(store: duplicated_unique_count_store)
           sql = ActiveRecord::Base.sanitize_sql_for_conditions(
             [
               sanitize_colon(query.grouped_query),
@@ -331,7 +385,9 @@ module Events
             ]
           )
 
-          prepare_grouped_result(connection.select_all(sql).rows)
+          grouped_results_with_value_as_count(
+            prepare_grouped_result(connection.select_all(sql).rows, columns: columns)
+          )
         end
       end
 
@@ -349,23 +405,27 @@ module Events
               }
             ]
           )
-          prepare_grouped_result(connection.select_all(sql).rows)
+          grouped_results_with_value_as_count(
+            prepare_grouped_result(connection.select_all(sql).rows)
+          )
         end
       end
 
-      def max
+      def max(with_count: true)
         Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
           sql = with_ctes(events_cte_queries(deduplicated_columns: %w[decimal_value]), <<-SQL)
-            SELECT max(events.decimal_value)
+            SELECT
+              max(events.decimal_value) as value,
+              #{with_count ? "count()" : "null"} as events_count
             FROM events
           SQL
 
-          connection.select_value(sql)
+          build_aggregation_result(connection.select_one(sql))
         end
       end
 
-      def grouped_max
-        groups, group_names = grouped_arel_columns
+      def grouped_max(columns = grouped_by, with_count: true)
+        groups, column_names = grouped_arel_columns(columns)
 
         Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
           ctes_sql = events_cte_queries(
@@ -375,28 +435,40 @@ module Events
 
           sql = with_ctes(ctes_sql, <<-SQL)
             SELECT
-              #{group_names},
-              MAX(property)
+              #{column_names},
+              MAX(property),
+              #{with_count ? "count()" : "null"}
             FROM events
-            GROUP BY #{group_names}
+            GROUP BY #{column_names}
           SQL
 
-          prepare_grouped_result(connection.select_all(sql).rows)
+          prepare_grouped_aggregated_values(connection.select_all(sql).rows, columns: columns)
         end
       end
 
-      def last
-        value = Events::Stores::Utils::ClickhouseConnection.with_retry do
-          events(ordered: true).last&.properties&.[](aggregation_property)
+      def last(with_count: true)
+        Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
+          ctes_sql = events_cte_queries(
+            select: [arel_table[:decimal_value].as("property"), arel_table[:timestamp]],
+            deduplicated_columns: %w[decimal_value properties]
+          )
+
+          sql = with_ctes(ctes_sql, <<-SQL)
+            SELECT
+              property as value,
+              #{with_count ? "count() OVER ()" : "null"} as events_count
+            FROM events
+            ORDER BY events.timestamp DESC
+            LIMIT 1
+          SQL
+
+          build_last_aggregation_result(connection.select_one(sql), with_count:)
         end
-
-        return value unless value
-
-        BigDecimal(value)
       end
 
-      def grouped_last
-        groups, group_names = grouped_arel_columns
+      def grouped_last(columns = grouped_by, with_count: true)
+        groups, column_names = grouped_arel_columns(columns)
+        distinct_on_names = grouped_by.present? ? grouped_arel_columns.last : nil
 
         Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
           ctes_sql = events_cte_queries(
@@ -404,15 +476,30 @@ module Events
             deduplicated_columns: %w[decimal_value properties]
           )
 
-          sql = with_ctes(ctes_sql, <<-SQL)
-            SELECT
-              DISTINCT ON (#{group_names}) #{group_names},
-              property
-            FROM events
-            ORDER BY #{group_names}, events.timestamp DESC
-          SQL
+          sql = if distinct_on_names
+            count_select = with_count ? "count() OVER (PARTITION BY #{distinct_on_names})" : "null"
+            with_ctes(ctes_sql, <<-SQL)
+              SELECT
+                DISTINCT ON (#{distinct_on_names}) #{column_names},
+                property,
+                #{count_select} as events_count
+              FROM events
+              ORDER BY #{distinct_on_names}, events.timestamp DESC
+            SQL
+          else
+            count_select = with_count ? "count() OVER ()" : "null"
+            with_ctes(ctes_sql, <<-SQL)
+              SELECT
+                #{column_names},
+                property,
+                #{count_select} as events_count
+              FROM events
+              ORDER BY events.timestamp DESC
+              LIMIT 1
+            SQL
+          end
 
-          prepare_grouped_result(connection.select_all(sql).rows)
+          prepare_grouped_aggregated_values(connection.select_all(sql).rows, columns: columns)
         end
       end
 
@@ -448,35 +535,38 @@ module Events
         end
       end
 
-      def sum
+      def sum(with_count: true)
         Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
           sql = with_ctes(events_cte_queries(deduplicated_columns: %w[decimal_value]), <<-SQL)
-            SELECT sum(events.decimal_value)
+            SELECT
+              sum(events.decimal_value) as value,
+              #{with_count ? "count()" : "null"} as events_count
             FROM events
           SQL
 
-          connection.select_value(sql) || 0
+          build_aggregation_result(connection.select_one(sql))
         end
       end
 
-      def grouped_sum
-        groups, group_names = grouped_arel_columns
+      def grouped_sum(columns = grouped_by, with_count: true)
+        groups, column_names = grouped_arel_columns(columns)
 
         Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
           ctes_sql = events_cte_queries(
             select: groups + [arel_table[:decimal_value].as("property")],
-            deduplicated_columns: %w[decimal_value]
+            deduplicated_columns: %w[decimal_value properties]
           )
 
           sql = with_ctes(ctes_sql, <<-SQL)
             SELECT
-              #{group_names},
-              sum(events.property)
+              #{column_names},
+              sum(events.property),
+              #{with_count ? "count()" : "null"}
             FROM events
-            GROUP BY #{group_names}
+            GROUP BY #{column_names}
           SQL
 
-          prepare_grouped_result(connection.select_all(sql).rows)
+          prepare_grouped_aggregated_values(connection.select_all(sql).rows, columns: columns)
         end
       end
 
@@ -492,6 +582,7 @@ module Events
         Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
           ctes_sql = events_cte_queries(
             select: [
+              arel_table[:decimal_value],
               Arel::Nodes::InfixOperation.new(
                 "*",
                 arel_table[:decimal_value],
@@ -502,11 +593,14 @@ module Events
           )
 
           sql = with_ctes(ctes_sql, <<-SQL)
-            SELECT sum(events.prorated_value)
+            SELECT
+              sum(events.prorated_value) as prorated_value,
+              sum(events.decimal_value) as value,
+              count() as events_count
             FROM events
           SQL
 
-          connection.select_value(sql)
+          build_prorated_aggregation_result(connection.select_one(sql))
         end
       end
 
@@ -522,6 +616,7 @@ module Events
         Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
           ctes_sql = events_cte_queries(
             select: groups + [
+              arel_table[:decimal_value],
               Arel::Nodes::InfixOperation.new(
                 "*",
                 arel_table[:decimal_value],
@@ -534,12 +629,14 @@ module Events
           sql = with_ctes(ctes_sql, <<-SQL)
             SELECT
               #{group_names},
-              sum(events.prorated_value)
+              sum(events.prorated_value) as prorated_value,
+              sum(events.decimal_value) as value,
+              count() as events_count
             FROM events
             GROUP BY #{group_names}
           SQL
 
-          prepare_grouped_result(connection.select_all(sql).rows)
+          prepare_grouped_prorated_result(connection.select_all(sql).rows)
         end
       end
 
@@ -584,7 +681,7 @@ module Events
                 from_datetime:,
                 to_datetime: to_datetime.ceil,
                 decimal_scale: DECIMAL_SCALE,
-                initial_value: initial_value || 0
+                initial_value: decimal_literal(initial_value || 0)
               }
             ]
           )
@@ -592,33 +689,35 @@ module Events
           connection.select_one(sql)
         end
 
-        BigDecimal(result["aggregation"].presence || 0)
+        build_weighted_aggregation_result(
+          value: BigDecimal(result["aggregation"].presence || 0),
+          variation_with_initial: BigDecimal(result["variation_with_initial"].presence || 0),
+          rows_count: result["rows_count"].to_i,
+          initial_value:
+        )
       end
 
-      def grouped_weighted_sum(initial_values: [])
+      def grouped_weighted_sum(columns = grouped_by, initial_value: 0, initial_values: [])
+        duplicated_weighted_sum_store = dup
+        duplicated_weighted_sum_store.grouped_by = columns
+
+        baseline_initial_values = if initial_values.present?
+          initial_values
+        elsif initial_value.to_d.nonzero?
+          [{groups: {}, value: initial_value}]
+        else
+          []
+        end
+
+        formatted_initial_values = duplicated_weighted_sum_store.formatted_weighted_sum_initial_values(baseline_initial_values)
+        return [] if formatted_initial_values.empty?
+
         Events::Stores::Utils::ClickhouseConnection.connection_with_retry do |connection|
-          query = Clickhouse::WeightedSumQuery.new(store: self)
-
-          # NOTE: build the list of initial values for each groups
-          #       from the events in the period
-          formated_initial_values = grouped_count.map do |group|
-            value = 0
-            previous_group = initial_values.find { |g| g[:groups] == group[:groups] }
-            value = previous_group[:value] if previous_group
-            {groups: group[:groups], value:}
-          end
-
-          # NOTE: add the initial values for groups that are not in the events
-          initial_values.each do |intial_value|
-            next if formated_initial_values.find { |g| g[:groups] == intial_value[:groups] }
-
-            formated_initial_values << intial_value
-          end
-          return [] if formated_initial_values.empty?
+          query = Clickhouse::WeightedSumQuery.new(store: duplicated_weighted_sum_store)
 
           sql = ActiveRecord::Base.sanitize_sql_for_conditions(
             [
-              sanitize_colon(query.grouped_query(initial_values: formated_initial_values)),
+              sanitize_colon(query.grouped_query(initial_values: formatted_initial_values)),
               {
                 from_datetime:,
                 to_datetime: to_datetime.ceil,
@@ -627,7 +726,7 @@ module Events
             ]
           )
 
-          prepare_grouped_result(connection.select_all(sql).rows, decimal: true)
+          prepare_grouped_weighted_values(connection.select_all(sql).rows, formatted_initial_values, columns: columns)
         end
       end
 
@@ -644,7 +743,7 @@ module Events
                   from_datetime:,
                   to_datetime: to_datetime.ceil,
                   decimal_scale: DECIMAL_SCALE,
-                  initial_value: initial_value || 0
+                  initial_value: decimal_literal(initial_value || 0)
                 }
               ]
             )
@@ -666,7 +765,7 @@ module Events
 
       def with_timestamp_boundaries(query, from_datetime, to_datetime)
         query = query.where(arel_table[:timestamp].gteq(from_datetime)) if from_datetime
-        query = query.where(arel_table[:timestamp].lteq(to_datetime)) if to_datetime
+        query = query.where(Arel.sql(upper_timestamp_boundary_sql(to_datetime, prefix: "events_enriched."))) if to_datetime
         query
       end
 
@@ -675,12 +774,17 @@ module Events
           scope = scope.where("events_enriched.properties[?] IN (?)", key.to_s, values)
         end
 
-        conditions = ignored_filters.map do |filters|
-          filters.map do |key, values|
+        conditions = ignored_filters.filter_map do |filters|
+          next if filters.empty?
+
+          clause = filters.filter_map do |key, values|
+            next if values.empty?
+
             ActiveRecord::Base.sanitize_sql_for_conditions(
               ["(coalesce(events_enriched.properties[?], '') IN (?))", key.to_s, values.map(&:to_s)]
             )
           end.join(" AND ")
+          clause.presence
         end
         sql = conditions.map { "(#{it})" }.join(" OR ")
         scope = scope.where.not(sql) if sql.present?
@@ -695,12 +799,17 @@ module Events
           )
         end
 
-        conditions = ignored_filters.map do |filters|
-          filters.map do |key, values|
+        conditions = ignored_filters.filter_map do |filters|
+          next if filters.empty?
+
+          clause = filters.filter_map do |key, values|
+            next if values.empty?
+
             ActiveRecord::Base.sanitize_sql_for_conditions(
               ["(coalesce(events_enriched.properties[?], '') IN (?))", key.to_s, values.map(&:to_s)]
             )
           end.join(" AND ")
+          clause.presence
         end
         sql = conditions.map { "(#{it})" }.join(" OR ")
         scope = scope.where(Arel::Nodes::Not.new(Arel::Nodes::SqlLiteral.new(sql))) if conditions.present?
@@ -749,13 +858,12 @@ module Events
       # NOTE: returns the values for each groups
       #       The result format will be an array of hash with the format:
       #       [{ groups: { 'cloud' => 'aws', 'region' => 'us_east_1' }, value: 12.9 }, ...]
-      def prepare_grouped_result(rows, timestamp: false, decimal: false)
+      def prepare_grouped_result(rows, timestamp: false, decimal: false, columns: grouped_by)
         rows.map do |row|
           last_group = timestamp ? -2 : -1
-          groups = row.flatten[...last_group].map(&:presence)
 
           result = {
-            groups: grouped_by.each_with_object({}).with_index { |(g, r), i| r.merge!(g => groups[i]) },
+            groups: build_groups(row.flatten[...last_group], columns:),
             value: decimal ? BigDecimal(row.last.presence || 0) : row.last
           }
 
@@ -765,25 +873,63 @@ module Events
         end
       end
 
+      # NOTE: Same as prepare_grouped_result but the last two columns of each row are
+      #       the aggregated value and the events count, returned as GroupedAggregationResult.
+      def prepare_grouped_aggregated_values(rows, columns: grouped_by)
+        rows.map do |row|
+          flat = row.flatten
+
+          GroupedAggregationResult.new(
+            groups: build_groups(flat[...-2], columns:),
+            value: flat[-2],
+            events_count: flat[-1].presence&.to_i
+          )
+        end
+      end
+
+      # NOTE: Same as prepare_grouped_aggregated_values but the last three columns of each
+      #       row are the prorated value, the non-prorated value and the events count,
+      #       returned as GroupedProratedAggregationResult.
+      def prepare_grouped_prorated_result(rows, columns: grouped_by)
+        rows.map do |row|
+          flat = row.flatten
+
+          build_grouped_prorated_aggregation_result(
+            groups: build_groups(flat[...-3], columns:),
+            prorated_value: flat[-3],
+            value: flat[-2],
+            events_count: flat[-1]
+          )
+        end
+      end
+
+      # NOTE: parses the grouped weighted_sum rows. The last three columns of each row are the weighted
+      #       aggregation, the sum of the differences (including the initial value) and the rows count
+      #       (including the 2 boundary rows). Correction is delegated to build_grouped_weighted_result.
+      def prepare_grouped_weighted_values(rows, initial_values, columns: grouped_by)
+        rows.map do |row|
+          flat = row.flatten
+
+          build_grouped_weighted_result(
+            groups: build_groups(flat[...-3], columns:),
+            value: BigDecimal(flat[-3].presence || 0),
+            variation_with_initial: BigDecimal(flat[-2].presence || 0),
+            rows_count: flat[-1].to_i,
+            initial_values:
+          )
+        end
+      end
+
       def arel_table
         @arel_table ||= ::Clickhouse::EventsEnriched.arel_table
       end
 
-      def grouped_arel_columns
+      def grouped_arel_columns(columns = grouped_by)
+        names = Array.new(columns.count) { |i| "g_#{i}" }
         [
-          grouped_by.map.with_index do |group, index|
-            Arel::Nodes::SqlLiteral.new(sanitized_property_name(group)).as("g_#{index}")
-          end,
-          group_names.join(", ")
+          columns.map.with_index { |col, i| Arel::Nodes::SqlLiteral.new(sanitized_property_name(col)).as("g_#{i}") },
+          names.join(", ")
         ]
-      end
-
-      def group_names
-        @group_names ||= Array.new(grouped_by.count) { |index| "g_#{index}" }
-      end
-
-      def joined_group_names
-        @joined_group_names ||= group_names.join(", ")
       end
 
       def grouped_by_columns(values)
@@ -794,6 +940,23 @@ module Events
 
       def operation_type_sql
         "events_enriched.sorted_properties['operation_type']"
+      end
+
+      def formatted_weighted_sum_initial_values(initial_values)
+        formatted_initial_values = grouped_count.map do |group|
+          value = 0
+          previous_group = initial_values.find { |g| g[:groups] == group.groups }
+          value = previous_group[:value] if previous_group
+          {groups: group.groups, value:}
+        end
+
+        initial_values.each do |initial_value|
+          next if formatted_initial_values.find { |g| g[:groups] == initial_value[:groups] }
+
+          formatted_initial_values << initial_value
+        end
+
+        formatted_initial_values
       end
     end
   end

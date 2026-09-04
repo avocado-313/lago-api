@@ -36,14 +36,14 @@ RSpec.describe Customers::RefreshWalletsService do
           :standard_charge,
           plan: subscription.plan,
           billable_metric:,
-          properties: {amount: "3"}
+          properties: {amount: "3", presentation_group_keys: [{value: "cloud"}]}
         )
 
         create(
           :standard_charge,
           plan: subscription.plan,
           billable_metric: pay_in_advance_billable_metric,
-          properties: {amount: "1"},
+          properties: {amount: "1", presentation_group_keys: [{value: "region"}]},
           pay_in_advance: true,
           invoiceable: true
         )
@@ -99,6 +99,35 @@ RSpec.describe Customers::RefreshWalletsService do
       expect { subject }.to change(customer, :awaiting_wallet_refresh).from(true).to(false)
     end
 
+    context "when charges have presentation_group_keys" do
+      before do
+        allow(Invoices::CustomerUsageService).to receive(:call!).and_call_original
+        allow(BillableMetrics::AggregationFactory).to receive(:new_instance).and_call_original
+      end
+
+      it "calls CustomerUsageService with UsageFilters::WITHOUT_PRESENTATION_FILTER" do
+        subject
+
+        customer.active_subscriptions.each do |subscription|
+          expect(Invoices::CustomerUsageService).to have_received(:call!).with(
+            customer:,
+            subscription:,
+            usage_filters: UsageFilters::WITHOUT_PRESENTATION_FILTER
+          )
+        end
+      end
+
+      it "calls AggregationFactory with presentation_by as empty array" do
+        subject
+
+        expect(BillableMetrics::AggregationFactory).to have_received(:new_instance).at_least(:once) do |args|
+          next unless args[:filters].key?(:presentation_by)
+
+          expect(args[:filters][:presentation_by]).to eq([])
+        end
+      end
+    end
+
     describe "current usage calculation" do
       let(:charges_to_datetime) { 1.week.from_now }
       let(:charges_from_datetime) { 1.week.ago }
@@ -108,6 +137,9 @@ RSpec.describe Customers::RefreshWalletsService do
           create(:invoice_subscription, subscription:, charges_from_datetime:, charges_to_datetime:) do |invoice_subscription|
             create(
               :charge_fee,
+              # Progressively-billed usage must net against the same metric it bills,
+              # so reuse the in-arrears charge that produces the ongoing usage.
+              charge: subscription.plan.charges.find { |c| c.billable_metric_id == billable_metric.id },
               subscription:,
               precise_coupons_amount_cents: 0,
               invoice: invoice_subscription.invoice,
@@ -161,7 +193,7 @@ RSpec.describe Customers::RefreshWalletsService do
         allow(Integrations::Aggregator::Taxes::Invoices::CreateDraftService)
           .to receive(:call)
           .and_return(
-            BaseService::Result.new.service_failure!(
+            Integrations::Aggregator::Taxes::Invoices::CreateDraftService::Result.new.service_failure!(
               code: "customerAddressCouldNotResolve",
               message: "Customer address could not resolve"
             )
@@ -175,10 +207,8 @@ RSpec.describe Customers::RefreshWalletsService do
       end
     end
 
-    context "when target_wallet_ids is provided" do
-      subject(:result) { described_class.call(customer:, include_generating_invoices:, target_wallet_ids: [target_wallet.id]) }
-
-      let!(:target_wallet) do
+    context "when the customer has multiple wallets" do
+      let!(:first_wallet) do
         create(
           :wallet,
           customer:,
@@ -191,7 +221,7 @@ RSpec.describe Customers::RefreshWalletsService do
         )
       end
 
-      let!(:other_wallet) do
+      let!(:second_wallet) do
         create(
           :wallet,
           customer:,
@@ -204,22 +234,22 @@ RSpec.describe Customers::RefreshWalletsService do
         )
       end
 
-      it "only calls RefreshOngoingUsageService for targeted wallets" do
+      it "refreshes every wallet together" do
         allow(Wallets::Balance::RefreshOngoingUsageService).to receive(:call!).and_call_original
 
         subject
 
         expect(Wallets::Balance::RefreshOngoingUsageService)
-          .to have_received(:call!).once
+          .to have_received(:call!).with(hash_including(wallet: first_wallet))
         expect(Wallets::Balance::RefreshOngoingUsageService)
-          .to have_received(:call!).with(hash_including(wallet: target_wallet))
+          .to have_received(:call!).with(hash_including(wallet: second_wallet))
       end
 
-      it "only updates last_ongoing_balance_sync_at for targeted wallets" do
+      it "updates last_ongoing_balance_sync_at on every wallet" do
         subject
 
-        expect(target_wallet.reload.last_ongoing_balance_sync_at).not_to be_nil
-        expect(other_wallet.reload.last_ongoing_balance_sync_at).to be_nil
+        expect(first_wallet.reload.last_ongoing_balance_sync_at).not_to be_nil
+        expect(second_wallet.reload.last_ongoing_balance_sync_at).not_to be_nil
       end
 
       it "returns all active wallets in the result" do
@@ -310,6 +340,158 @@ RSpec.describe Customers::RefreshWalletsService do
         expect(unrestricted_wallet.credits_ongoing_usage_balance).to eq(5.0)
         expect(unrestricted_wallet.ongoing_balance_cents).to eq(1500)
         expect(unrestricted_wallet.credits_ongoing_balance).to eq(15.0)
+      end
+    end
+
+    context "when customer has multi-currency subscriptions" do
+      subject(:result) { described_class.call(customer: mc_customer, include_generating_invoices: false) }
+
+      let(:mc_org) { create(:organization) }
+      let(:mc_customer) { create(:customer, organization: mc_org, awaiting_wallet_refresh: true) }
+      let(:mc_billable_metric) { create(:billable_metric, organization: mc_org, aggregation_type: "count_agg") }
+      let(:mc_pia_billable_metric) { create(:billable_metric, organization: mc_org, aggregation_type: "count_agg") }
+
+      let(:usd_plan) { create(:plan, organization: mc_org, amount_cents: 10_000, amount_currency: "USD") }
+      let(:eur_plan) { create(:plan, organization: mc_org, amount_cents: 10_000, amount_currency: "EUR") }
+
+      let(:usd_subscription) { create(:subscription, organization: mc_org, customer: mc_customer, plan: usd_plan, started_at: Time.zone.now - 1.year) }
+      let(:eur_subscription) { create(:subscription, organization: mc_org, customer: mc_customer, plan: eur_plan, started_at: Time.zone.now - 1.year) }
+
+      let!(:usd_wallet) do
+        create(
+          :wallet,
+          customer: mc_customer,
+          organization: mc_org,
+          currency: "USD",
+          balance_cents: 10_000,
+          ongoing_balance_cents: 10_000,
+          ongoing_usage_balance_cents: 0,
+          credits_balance: 100.0,
+          credits_ongoing_balance: 100.0,
+          credits_ongoing_usage_balance: 0
+        )
+      end
+
+      let!(:eur_wallet) do
+        create(
+          :wallet,
+          customer: mc_customer,
+          organization: mc_org,
+          currency: "EUR",
+          balance_cents: 10_000,
+          ongoing_balance_cents: 10_000,
+          ongoing_usage_balance_cents: 0,
+          credits_balance: 100.0,
+          credits_ongoing_balance: 100.0,
+          credits_ongoing_usage_balance: 0
+        )
+      end
+
+      before do
+        # In-arrears charges
+        create(:standard_charge, plan: usd_plan, billable_metric: mc_billable_metric, properties: {amount: "3"})
+        create(:standard_charge, plan: eur_plan, billable_metric: mc_billable_metric, properties: {amount: "5"})
+
+        # Pay-in-advance charges
+        create(:standard_charge, plan: usd_plan, billable_metric: mc_pia_billable_metric, properties: {amount: "2"}, pay_in_advance: true, invoiceable: true)
+        create(:standard_charge, plan: eur_plan, billable_metric: mc_pia_billable_metric, properties: {amount: "4"}, pay_in_advance: true, invoiceable: true)
+
+        # 2 events for USD in-arrears -> 2 * $3 = 600 cents
+        create_list(
+          :event, 2,
+          organization: mc_org,
+          subscription: usd_subscription,
+          customer: mc_customer,
+          code: mc_billable_metric.code
+        )
+
+        # 3 events for EUR in-arrears -> 3 * €5 = 1500 cents
+        create_list(
+          :event, 3,
+          organization: mc_org,
+          subscription: eur_subscription,
+          customer: mc_customer,
+          code: mc_billable_metric.code
+        )
+
+        # 1 event for USD PIA -> 1 * $2 = 200 cents (included in total usage, subtracted as billed)
+        create(
+          :event,
+          organization: mc_org,
+          subscription: usd_subscription,
+          customer: mc_customer,
+          code: mc_pia_billable_metric.code
+        )
+
+        # 1 event for EUR PIA -> 1 * €4 = 400 cents (included in total usage, subtracted as billed)
+        create(
+          :event,
+          organization: mc_org,
+          subscription: eur_subscription,
+          customer: mc_customer,
+          code: mc_pia_billable_metric.code
+        )
+      end
+
+      it "calculates ongoing balance separately per currency" do
+        expect(result).to be_success
+
+        # USD: in-arrears 600 + PIA 200 = 800 total usage, minus 200 PIA billed = 600 ongoing usage
+        expect(usd_wallet.reload.ongoing_usage_balance_cents).to eq(600)
+        expect(usd_wallet.ongoing_balance_cents).to eq(9400)
+
+        # EUR: in-arrears 1500 + PIA 400 = 1900 total usage, minus 400 PIA billed = 1500 ongoing usage
+        expect(eur_wallet.reload.ongoing_usage_balance_cents).to eq(1500)
+        expect(eur_wallet.ongoing_balance_cents).to eq(8500)
+      end
+    end
+
+    context "when ongoing usage cascades across multiple wallets" do
+      subject(:result) { described_class.call(customer: cascade_customer, include_generating_invoices: false) }
+
+      let(:cascade_org) { create(:organization) }
+      let(:cascade_customer) { create(:customer, organization: cascade_org, awaiting_wallet_refresh: true) }
+      let(:cascade_bm) { create(:billable_metric, organization: cascade_org, aggregation_type: "count_agg") }
+      let(:cascade_subscription) { create(:subscription, organization: cascade_org, customer: cascade_customer, started_at: Time.zone.now - 1.year) }
+
+      # Wallet B (free, consumed first) and Wallet A (paid), as in the ticket worked example.
+      let(:wallet_b) do
+        create(:wallet, customer: cascade_customer, organization: cascade_org, balance_cents: 50, priority: 1,
+          ongoing_balance_cents: 50, credits_balance: 0.5, credits_ongoing_balance: 0.5)
+      end
+      let(:wallet_a) do
+        create(:wallet, customer: cascade_customer, organization: cascade_org, balance_cents: 150, priority: 2,
+          ongoing_balance_cents: 150, credits_balance: 1.5, credits_ongoing_balance: 1.5)
+      end
+
+      before do
+        create(:standard_charge, plan: cascade_subscription.plan, billable_metric: cascade_bm, properties: {amount: "0.8"})
+        wallet_b
+        wallet_a
+        # 1 event * $0.80 = 80 cents of ongoing usage
+        create(:event, organization: cascade_org, subscription: cascade_subscription, customer: cascade_customer, code: cascade_bm.code)
+      end
+
+      it "fills the priority wallet then spills the overflow onto the next" do
+        expect(result).to be_success
+
+        expect(wallet_b.reload.ongoing_balance_cents).to eq(0)
+        expect(wallet_b.ongoing_usage_balance_cents).to eq(50)
+        expect(wallet_a.reload.ongoing_balance_cents).to eq(120)
+        expect(wallet_a.ongoing_usage_balance_cents).to eq(30)
+      end
+
+      context "when the priority wallet has an active threshold-based recurring rule" do
+        before { create(:recurring_transaction_rule, wallet: wallet_b, organization: cascade_org, trigger: :threshold) }
+
+        it "keeps the legacy behavior: the threshold wallet goes negative and does not cascade" do
+          expect(result).to be_success
+
+          expect(wallet_b.reload.ongoing_balance_cents).to eq(-30)
+          expect(wallet_b.ongoing_usage_balance_cents).to eq(80)
+          expect(wallet_a.reload.ongoing_balance_cents).to eq(150)
+          expect(wallet_a.ongoing_usage_balance_cents).to eq(0)
+        end
       end
     end
   end

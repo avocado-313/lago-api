@@ -11,6 +11,7 @@ RSpec.describe Types::Integrations::PremiumIntegrationTypeEnum do
       hubspot
       netsuite
       okta
+      entra_id
       progressive_billing
       lifetime_usage
       revenue_analytics
@@ -32,6 +33,8 @@ RSpec.describe Types::Integrations::PremiumIntegrationTypeEnum do
       events_targeting_wallets
       security_logs
       granular_lifetime_usage
+      order_forms
+      revenue_recognition
     ]
   end
 

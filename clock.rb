@@ -37,6 +37,12 @@ module Clockwork
       .perform_later
   end
 
+  if Utils::DedicatedWorkerConfig.any?
+    every(Utils::DedicatedWorkerConfig.refresh_interval, "schedule:process_dedicated_orgs_subscription_activities") do
+      Clock::ProcessDedicatedOrgsSubscriptionActivitiesJob.perform_later
+    end
+  end
+
   lifetime_usage_refresh_interval = ENV["LAGO_LIFETIME_USAGE_REFRESH_INTERVAL_SECONDS"].presence || 5.minutes
   every(lifetime_usage_refresh_interval.to_i.seconds, "schedule:refresh_lifetime_usages") do
     unless ENV["LAGO_DISABLE_LIFETIME_USAGE_REFRESH"] == "true"
@@ -47,11 +53,19 @@ module Clockwork
   end
 
   if ENV["LAGO_MEMCACHE_SERVERS"].present? || ENV["LAGO_REDIS_CACHE_URL"].present?
-    every(5.minutes, "schedule:refresh_wallets_ongoing_balance") do
-      unless ENV["LAGO_DISABLE_WALLET_REFRESH"] == "true"
+    unless ENV["LAGO_DISABLE_WALLET_REFRESH"] == "true"
+      wallet_refresh_interval = ENV["LAGO_WALLET_ONGOING_BALANCE_REFRESH_INTERVAL_SECONDS"].presence || 5.minutes
+
+      every(wallet_refresh_interval.to_i.seconds, "schedule:refresh_wallets_ongoing_balance") do
         Clock::RefreshWalletsOngoingBalanceJob
-          .set(sentry: {"slug" => "lago_refresh_wallets_ongoing_balance", "cron" => "*/5 * * * *"})
+          .set(sentry: {"slug" => "lago_refresh_wallets_ongoing_balance", "cron" => "#{wallet_refresh_interval} interval"})
           .perform_later
+      end
+
+      if Utils::DedicatedWorkerConfig.any?
+        every(Utils::DedicatedWorkerConfig.refresh_interval, "schedule:refresh_dedicated_org_wallets") do
+          Clock::RefreshDedicatedOrgWalletsOngoingBalanceJob.perform_later
+        end
       end
     end
   end
@@ -71,6 +85,12 @@ module Clockwork
   every(1.hour, "schedule:api_keys_track_usage", at: "*:15") do
     Clock::ApiKeys::TrackUsageJob
       .set(sentry: {"slug" => "lago_api_keys_track_usage", "cron" => "15 */1 * * *"})
+      .perform_later
+  end
+
+  every(1.hour, "schedule:expire_incomplete_subscriptions", at: "*:20") do
+    Clock::ExpireIncompleteSubscriptionsJob
+      .set(sentry: {"slug" => "lago_expire_incomplete_subscriptions", "cron" => "20 */1 * * *"})
       .perform_later
   end
 
@@ -128,6 +148,18 @@ module Clockwork
       .perform_later
   end
 
+  every(1.hour, "schedule:expire_order_forms", at: "*:40") do
+    Clock::ExpireOrderFormsJob
+      .set(sentry: {"slug" => "lago_expire_order_forms", "cron" => "40 */1 * * *"})
+      .perform_later
+  end
+
+  every(1.hour, "schedule:execute_scheduled_orders", at: "*:45") do
+    Clock::ExecuteScheduledOrdersJob
+      .set(sentry: {"slug" => "lago_execute_scheduled_orders", "cron" => "45 */1 * * *"})
+      .perform_later
+  end
+
   every(1.day, "schedule:clean_webhooks", at: "01:00") do
     Clock::WebhooksCleanupJob
       .set(sentry: {"slug" => "lago_clean_webhooks", "cron" => "0 1 * * *"})
@@ -176,9 +208,9 @@ module Clockwork
 
   # NOTE: Enable wallets and lifetime usage refresh from the events-processor
   if ENV["LAGO_REDIS_STORE_URL"].present? && ENV["LAGO_CLICKHOUSE_ENABLED"].present?
-    every(1.minute, "schedule:refresh_flagged_subscriptions") do
+    every(10.seconds, "schedule:refresh_flagged_subscriptions") do
       Clock::ConsumeSubscriptionRefreshedQueueJob
-        .set(sentry: {"slug" => "lago_refresh_flagged_subscriptions", "cron" => "*/1 * * * *"})
+        .set(sentry: {"slug" => "lago_refresh_flagged_subscriptions"})
         .perform_later
     end
   end

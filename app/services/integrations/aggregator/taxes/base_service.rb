@@ -4,8 +4,11 @@ module Integrations
   module Aggregator
     module Taxes
       class BaseService < Integrations::Aggregator::BaseService
+        Result = BaseResult[:fees, :succeeded_id, :invoice_id]
+
         SPECIAL_TAXATION_TYPES = %w[exempt notCollecting productNotTaxed jurisNotTaxed jurisHasNoTax].freeze
         CUSTOMER_ADDRESS_INVALID = "customerAddressCouldNotResolve"
+        OUT_OF_MEMORY_ERROR = "function_runtime_out_of_memory"
 
         def initialize
           super(integration:)
@@ -48,7 +51,7 @@ module Integrations
             result.fees = fees.map do |fee|
               taxes_to_pay = fee["tax_amount_cents"]
 
-              OpenStruct.new(
+              TaxResult.new(
                 item_key: fee["item_key"],
                 item_id: fee["item_id"],
                 item_code: fee["item_code"],
@@ -61,13 +64,10 @@ module Integrations
           else
             code, message = retrieve_error_details(body["failedInvoices"].first["validation_errors"])
 
-            # Temp fix for the API limit issue
-            message = "API limit" if message == "Internal server error: resource contention."
+            raise Integrations::Aggregator::OutOfMemoryError if message.include?(OUT_OF_MEMORY_ERROR)
+            raise Integrations::Aggregator::ServerContentionError, message if server_contention_error?(message)
 
-            unless message.include?("API limit")
-              deliver_tax_error_webhook(customer:, code:, message:) if customer.persisted? # Do not send this webhook in preview mode
-            end
-
+            deliver_tax_error_webhook(customer:, code:, message:) if customer.persisted? # Do not send this webhook in preview mode
             result.service_failure!(code:, message:)
           end
         end
@@ -75,7 +75,7 @@ module Integrations
         def tax_breakdown(breakdown, taxes_to_pay)
           breakdown.map do |b|
             if SPECIAL_TAXATION_TYPES.include?(b["type"])
-              OpenStruct.new(
+              TaxResult::TaxBreakdownItem.new(
                 name: humanize_tax_name(b["reason"].presence || b["type"]),
                 rate: "0.00",
                 tax_amount: 0,
@@ -84,14 +84,14 @@ module Integrations
             elsif b["rate"]
               # If there are taxes, that client shouldn't pay, we nullify the taxes
               if taxes_to_pay.zero? && b["tax_amount"].positive?
-                OpenStruct.new(
+                TaxResult::TaxBreakdownItem.new(
                   name: "Tax",
                   rate: "0.00",
                   tax_amount: 0,
                   type: "tax"
                 )
               else
-                OpenStruct.new(
+                TaxResult::TaxBreakdownItem.new(
                   name: b["name"],
                   rate: b["rate"],
                   tax_amount: b["tax_amount"],
@@ -99,7 +99,7 @@ module Integrations
                 )
               end
             else
-              OpenStruct.new(
+              TaxResult::TaxBreakdownItem.new(
                 name: humanize_tax_name(b["reason"].presence || b["type"] || "unknown_taxation"),
                 rate: "0.00",
                 tax_amount: 0,
@@ -107,6 +107,10 @@ module Integrations
               )
             end
           end
+        end
+
+        def server_contention_error?(message)
+          message.include?("API limit") || message.include?("resource contention")
         end
 
         def retrieve_error_details(validation_error)

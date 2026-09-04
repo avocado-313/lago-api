@@ -5,16 +5,19 @@ module PaymentRequests
     class StripeService < BaseService
       include Customers::PaymentProviderFinder
       include Updatable
+      include TypedResults
 
       PROVIDER_NAME = "Stripe"
 
-      def initialize(payable = nil)
+      RESULTS = {
+        generate_payment_url: BaseResult[:payment_url],
+        update_payment_status: BaseResult[:payment, :payable]
+      }.freeze
+
+      private
+
+      def generate_payment_url(payable)
         @payable = payable
-
-        super(nil)
-      end
-
-      def generate_payment_url
         result_url = ::Stripe::Checkout::Session.create(
           payment_url_payload,
           {
@@ -29,7 +32,7 @@ module PaymentRequests
         result.third_party_failure!(third_party: PROVIDER_NAME, error_code: e.code, error_message: e.message)
       end
 
-      def update_payment_status(organization_id:, status:, stripe_payment:)
+      def update_payment_status(organization_id:, status:, stripe_payment:, amount_cents: nil)
         payment = Payment.find_by(provider_payment_id: stripe_payment.id)
         return result if payment&.payable&.organization_id.present? && payment.payable.organization_id != organization_id
 
@@ -43,15 +46,13 @@ module PaymentRequests
 
         if payment.payable.payment_succeeded?
           if payment.persisted?
+            @payable = payment.payable
             result.payment = payment
-            result.payable = payment.payable
+            result.payable = @payable
           end
 
           return result
         end
-
-        result.payment = payment
-        result.payable = payment.payable
 
         processing = status == "processing"
         payment.status = status
@@ -59,6 +60,10 @@ module PaymentRequests
         payable_payment_status = payment.payment_provider&.determine_payment_status(payment.status)
         payment.payable_payment_status = payable_payment_status
         payment.save!
+
+        @payable = payment.payable
+        result.payment = payment
+        result.payable = @payable
 
         update_payable_payment_status(payment_status: payable_payment_status, processing:)
         update_invoices_payment_status(payment_status: payable_payment_status, processing:)
@@ -71,14 +76,21 @@ module PaymentRequests
       rescue ActiveRecord::RecordInvalid => e
         result.record_validation_failure!(record: e.record)
       rescue ActiveRecord::RecordNotUnique
+        # NOTE: Another writer (a parallel webhook worker, or PaymentProviders::Stripe::Payments::CreateService)
+        #       committed the Payment first. Return the persisted row so the
+        #       caller can still enqueue downstream side effects (e.g. SetPaymentMethodAndCreateReceiptJob).
+        payment = Payment.find_by(provider_payment_id: stripe_payment.id)
+        if payment
+          @payable = payment.payable
+          result.payment = payment
+          result.payable = @payable
+        end
         result
       rescue BaseService::FailedResult => e
         result.fail_with_error!(e)
       end
 
-      private
-
-      attr_accessor :payable
+      attr_reader :payable
 
       delegate :organization, :customer, to: :payable
 
@@ -115,6 +127,8 @@ module PaymentRequests
 
       def update_invoices_payment_status(payment_status:, deliver_webhook: true, processing: false)
         result.payable.invoices.each do |invoice|
+          next if invoice.payment_succeeded? && !payment_status_succeeded?(payment_status)
+
           Invoices::UpdateService.call(
             invoice: invoice,
             params: {
@@ -141,7 +155,7 @@ module PaymentRequests
       end
 
       def payment_url_payload
-        {
+        payload = {
           line_items: line_items,
           mode: "payment",
           success_url: success_redirect_url,
@@ -157,6 +171,12 @@ module PaymentRequests
             }
           }
         }
+
+        if stripe_payment_provider.require_terms_of_service_consent
+          payload[:consent_collection] = {terms_of_service: "required"}
+        end
+
+        payload
       end
 
       def handle_missing_payment(organization_id, stripe_payment)
@@ -220,7 +240,7 @@ module PaymentRequests
         return unless payment_status_succeeded?(payment_status)
         return unless payable.try(:dunning_campaign)
 
-        customer.reset_dunning_campaign!
+        customer.reset_dunning_campaign_for_currency!(payable.currency)
       end
     end
   end

@@ -2,6 +2,8 @@
 
 module Invoices
   class EnsureCompletedViesCheckService < BaseService
+    Result = BaseResult[:non_invoiceable_fees]
+
     def initialize(invoice:, finalizing: true)
       @invoice = invoice
       @customer = invoice&.customer
@@ -19,7 +21,7 @@ module Invoices
       # Check if VIES validation is pending
       return result unless customer.vies_check_in_progress?
 
-      invoice.status = :pending if finalizing
+      invoice.status = (invoice.subscription_gated? ? :open : :pending) if finalizing
       invoice.tax_status = :pending
       invoice.save!
 

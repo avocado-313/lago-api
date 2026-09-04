@@ -7,10 +7,12 @@ module V1
         lago_id: model.id,
         lago_customer_id: model.customer_id,
         external_customer_id: model.customer.external_id,
+        billing_entity_code: model.billing_entity.code,
         status: model.status,
         currency: model.currency,
         name: model.name,
         code: model.code,
+        purchase_order_number: model.purchase_order_number,
         rate_amount: model.rate_amount,
         credits_balance: model.credits_balance,
         credits_ongoing_balance: model.credits_ongoing_balance,
@@ -43,10 +45,14 @@ module V1
 
     def recurring_transaction_rules
       ::CollectionSerializer.new(
-        model.recurring_transaction_rules.active,
+        active_recurring_transaction_rules,
         ::V1::Wallets::RecurringTransactionRuleSerializer,
         collection_name: "recurring_transaction_rules"
       ).serialize
+    end
+
+    def active_recurring_transaction_rules
+      model.recurring_transaction_rules.select(&:currently_active?)
     end
 
     def limitations

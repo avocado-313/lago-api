@@ -2,6 +2,14 @@
 
 module UsageMonitoring
   class ProcessOrganizationSubscriptionActivitiesJob < ApplicationJob
+    queue_as do
+      Utils::DedicatedWorkerConfig.queue_for(
+        arguments.first,
+        dedicated: Utils::DedicatedWorkerConfig::DEDICATED_ALERTS_QUEUE,
+        default: ActiveModel::Type::Boolean.new.cast(ENV["SIDEKIQ_ALERTS"]) ? :alerts : :default
+      )
+    end
+
     unique :until_executed, on_conflict: :log
 
     def perform(organization_id)

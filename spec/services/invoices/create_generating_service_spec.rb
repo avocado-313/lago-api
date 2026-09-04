@@ -16,6 +16,12 @@ RSpec.describe Invoices::CreateGeneratingService do
   let(:recurring) { false }
 
   describe "call" do
+    it "populates the search terms" do
+      result = create_service.call
+
+      expect(result.invoice.reload.search_terms).to include(result.invoice.number, customer.name)
+    end
+
     it "creates an invoice" do
       result = create_service.call
 
@@ -43,6 +49,34 @@ RSpec.describe Invoices::CreateGeneratingService do
         expect(result.invoice.timezone).to eq("America/Los_Angeles")
         expect(result.invoice.issuing_date.to_s).to eq("2022-11-24")
         expect(result.invoice.expected_finalization_date.to_s).to eq("2022-11-24")
+      end
+    end
+
+    context "when an explicit billing_entity is passed" do
+      subject(:create_service) do
+        described_class.new(customer:, invoice_type:, currency:, datetime:, billing_entity:)
+      end
+
+      let(:billing_entity) { create(:billing_entity, organization: customer.organization) }
+
+      it "stamps the invoice with the provided billing entity" do
+        result = create_service.call
+
+        expect(result).to be_success
+        expect(result.invoice.billing_entity).to eq(billing_entity)
+      end
+    end
+
+    context "when purchase_order_number is passed" do
+      subject(:create_service) do
+        described_class.new(customer:, invoice_type:, currency:, datetime:, purchase_order_number: "PO-123")
+      end
+
+      it "stamps the purchase order number on the invoice" do
+        result = create_service.call
+
+        expect(result).to be_success
+        expect(result.invoice.purchase_order_number).to eq("PO-123")
       end
     end
 
@@ -122,6 +156,19 @@ RSpec.describe Invoices::CreateGeneratingService do
           expect(result.invoice.timezone).to eq("America/Los_Angeles")
           expect(result.invoice.issuing_date.to_s).to eq("2022-11-27")
           expect(result.invoice.expected_finalization_date.to_s).to eq("2022-11-27")
+        end
+      end
+
+      context "when subscription_gated is true" do
+        subject(:create_service) do
+          described_class.new(customer:, invoice_type:, currency:, datetime:, charge_in_advance:, invoicing_reason:, subscription_gated: true)
+        end
+
+        it "skips grace period and uses current date as issuing date" do
+          result = create_service.call
+
+          expect(result.invoice.issuing_date.to_s).to eq(datetime.to_date.to_s)
+          expect(result.invoice.expected_finalization_date.to_s).to eq(datetime.to_date.to_s)
         end
       end
     end

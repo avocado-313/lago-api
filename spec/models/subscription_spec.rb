@@ -8,6 +8,7 @@ RSpec.describe Subscription do
   let(:plan) { create(:plan) }
 
   it_behaves_like "paper_trail traceable"
+  it_behaves_like "a model with a purchase order number"
 
   describe "enums" do
     it do
@@ -30,9 +31,29 @@ RSpec.describe Subscription do
         .backed_by_column_of_type(:enum)
         .with_values(generate: "generate", skip: "skip")
         .with_prefix(:on_termination_invoice)
-      expect(subject).to define_enum_for(:cancelation_reason)
+      expect(subject).to define_enum_for(:cancellation_reason)
         .backed_by_column_of_type(:enum)
-        .with_values(payment_failed: "payment_failed", timeout: "timeout")
+        .with_values(payment_failed: "payment_failed", timeout: "timeout", manual: "manual")
+    end
+  end
+
+  describe "#effective_billing_anchor_date" do
+    it "returns the explicit anchor when set" do
+      subscription = build(:subscription, billing_anchor_date: Date.new(2026, 1, 1), started_at: Time.zone.parse("2026-01-15"))
+
+      expect(subscription.effective_billing_anchor_date).to eq(Date.new(2026, 1, 1))
+    end
+
+    it "falls back to the start date" do
+      subscription = build(:subscription, billing_anchor_date: nil, started_at: Time.zone.parse("2026-01-15"))
+
+      expect(subscription.effective_billing_anchor_date).to eq(Date.new(2026, 1, 15))
+    end
+
+    it "falls back to subscription_at when the subscription has not started" do
+      subscription = build(:subscription, billing_anchor_date: nil, started_at: nil, subscription_at: Time.zone.parse("2026-02-03"))
+
+      expect(subscription.effective_billing_anchor_date).to eq(Date.new(2026, 2, 3))
     end
   end
 
@@ -42,7 +63,7 @@ RSpec.describe Subscription do
       expect(subject).to belong_to(:plan)
       expect(subject).to belong_to(:previous_subscription).optional
       expect(subject).to belong_to(:organization)
-      expect(subject).to have_one(:billing_entity).through(:customer)
+      expect(subject).to belong_to(:billing_entity).optional
       expect(subject).to have_many(:applied_invoice_custom_sections).class_name("Subscription::AppliedInvoiceCustomSection").dependent(:destroy)
       expect(subject).to have_many(:selected_invoice_custom_sections).through(:applied_invoice_custom_sections).source(:invoice_custom_section)
       expect(subject).to have_many(:next_subscriptions).class_name("Subscription").with_foreign_key(:previous_subscription_id)
@@ -50,11 +71,13 @@ RSpec.describe Subscription do
       expect(subject).to have_many(:invoice_subscriptions)
       expect(subject).to have_many(:invoices).through(:invoice_subscriptions)
       expect(subject).to have_many(:integration_resources)
+      expect(subject).to have_many(:billing_object_connections).dependent(:destroy)
       expect(subject).to have_many(:fees)
       expect(subject).to have_many(:daily_usages)
       expect(subject).to have_many(:usage_thresholds)
       expect(subject).to have_many(:fixed_charges).through(:plan)
       expect(subject).to have_many(:fixed_charge_events)
+      expect(subject).to have_many(:fixed_charge_units_overrides).class_name("Subscription::FixedChargeUnitsOverride")
       expect(subject).to have_many(:add_ons).through(:fixed_charges)
       expect(subject).to have_one(:lifetime_usage).autosave(true)
       expect(subject).to have_one(:subscription_activity).class_name("UsageMonitoring::SubscriptionActivity")
@@ -68,6 +91,50 @@ RSpec.describe Subscription do
   describe "Clickhouse associations", clickhouse: true do
     it do
       expect(subject).to have_many(:activity_logs).class_name("Clickhouse::ActivityLog")
+    end
+  end
+
+  describe "#billing_entity" do
+    let(:organization) { create(:organization) }
+    let(:customer) { create(:customer, organization:) }
+
+    context "when subscription has a billing_entity" do
+      let(:billing_entity) { create(:billing_entity, organization:) }
+      let(:subscription) { create(:subscription, customer:, billing_entity:) }
+
+      it "returns the subscription billing_entity" do
+        expect(subscription.billing_entity).to eq(billing_entity)
+      end
+    end
+
+    context "when subscription does not have a billing_entity" do
+      let(:subscription) { create(:subscription, customer:, billing_entity: nil) }
+
+      it "falls back to the customer billing_entity" do
+        expect(subscription.billing_entity).to eq(customer.billing_entity)
+      end
+    end
+  end
+
+  describe "#applicable_billing_entity_id" do
+    let(:organization) { create(:organization) }
+    let(:customer) { create(:customer, organization:) }
+
+    context "when subscription has a billing_entity_id" do
+      let(:billing_entity) { create(:billing_entity, organization:) }
+      let(:subscription) { create(:subscription, customer:, billing_entity:) }
+
+      it "returns the subscription's own billing_entity_id" do
+        expect(subscription.applicable_billing_entity_id).to eq(billing_entity.id)
+      end
+    end
+
+    context "when subscription has no billing_entity_id" do
+      let(:subscription) { create(:subscription, customer:, billing_entity: nil) }
+
+      it "falls back to the customer's billing_entity_id" do
+        expect(subscription.applicable_billing_entity_id).to eq(customer.billing_entity_id)
+      end
     end
   end
 
@@ -113,6 +180,38 @@ RSpec.describe Subscription do
 
       it "returns only incomplete subscriptions with expirable activation rules" do
         expect(described_class.expirable).to match_array([expirable_subscription])
+      end
+    end
+
+    describe ".without_fixed_charge_units_override_for" do
+      let(:organization) { create(:organization) }
+      let(:plan) { create(:plan, organization:) }
+      let(:fixed_charge) { create(:fixed_charge, plan:, organization:) }
+      let(:other_fixed_charge) { create(:fixed_charge, plan:, organization:) }
+      let(:overridden_sub) { create(:subscription, plan:) }
+      let(:bare_sub) { create(:subscription, plan:) }
+      let(:other_fc_overridden_sub) { create(:subscription, plan:) }
+
+      before do
+        create(:subscription_fixed_charge_units_override, subscription: overridden_sub, fixed_charge:, organization:)
+        create(:subscription_fixed_charge_units_override, subscription: other_fc_overridden_sub, fixed_charge: other_fixed_charge, organization:)
+      end
+
+      it "excludes subscriptions with a kept override for the given fixed charge" do
+        result = described_class.without_fixed_charge_units_override_for(fixed_charge)
+
+        expect(result).to include(bare_sub, other_fc_overridden_sub)
+        expect(result).not_to include(overridden_sub)
+      end
+
+      context "when the override row was discarded" do
+        before do
+          Subscription::FixedChargeUnitsOverride.unscoped.find_by(subscription: overridden_sub, fixed_charge:).discard!
+        end
+
+        it "stops excluding the subscription" do
+          expect(described_class.without_fixed_charge_units_override_for(fixed_charge)).to include(overridden_sub)
+        end
       end
     end
   end
@@ -220,6 +319,46 @@ RSpec.describe Subscription do
           expect(incomplete_sub).not_to be_valid
         end
       end
+
+      context "when a pending subscription transitions to active" do
+        let(:external_id) { SecureRandom.uuid }
+        let(:pending_subscription) do
+          create(
+            :subscription,
+            plan:,
+            status: :pending,
+            external_id:,
+            customer: create(:customer, organization:)
+          )
+        end
+
+        before { pending_subscription }
+
+        context "when another active subscription with the same external_id exists" do
+          before do
+            create(
+              :subscription,
+              plan:,
+              status: :active,
+              external_id:,
+              customer: create(:customer, organization:)
+            )
+          end
+
+          it "rejects the activation" do
+            pending_subscription.assign_attributes(status: :active)
+            expect(pending_subscription).not_to be_valid
+            expect(pending_subscription.errors[:external_id]).to include("value_already_exist")
+          end
+        end
+
+        context "when no other active subscription with the same external_id exists" do
+          it "allows the activation" do
+            pending_subscription.assign_attributes(status: :active)
+            expect(pending_subscription).to be_valid
+          end
+        end
+      end
     end
 
     describe "started_at validation" do
@@ -312,6 +451,52 @@ RSpec.describe Subscription do
       let(:subscription) { create(:subscription, :incomplete) }
 
       before { create(:subscription_activation_rule, subscription:, status: :satisfied) }
+
+      it { is_expected.to be(false) }
+    end
+  end
+
+  describe "#payment_gated?" do
+    subject(:payment_gated?) { subscription.payment_gated? }
+
+    context "when incomplete with pending payment rule" do
+      let(:subscription) do
+        create(:subscription, :incomplete, :with_activation_rules,
+          activation_rules_config: [{type: "payment", timeout_hours: 48, status: "pending"}])
+      end
+
+      it { is_expected.to be(true) }
+    end
+
+    context "when incomplete with satisfied payment rule" do
+      let(:subscription) do
+        create(:subscription, :incomplete, :with_activation_rules,
+          activation_rules_config: [{type: "payment", timeout_hours: 48, status: "satisfied"}])
+      end
+
+      it { is_expected.to be(false) }
+    end
+
+    context "when active with pending payment rule" do
+      let(:subscription) do
+        create(:subscription, :with_activation_rules,
+          activation_rules_config: [{type: "payment", timeout_hours: 48, status: "pending"}])
+      end
+
+      it { is_expected.to be(false) }
+    end
+
+    context "when pending with pending payment rule" do
+      let(:subscription) do
+        create(:subscription, :pending, :with_activation_rules,
+          activation_rules_config: [{type: "payment", timeout_hours: 48, status: "pending"}])
+      end
+
+      it { is_expected.to be(false) }
+    end
+
+    context "when incomplete with no activation rules" do
+      let(:subscription) { create(:subscription, :incomplete) }
 
       it { is_expected.to be(false) }
     end
@@ -502,6 +687,34 @@ RSpec.describe Subscription do
     end
   end
 
+  describe "#billing_reference_time" do
+    around { |example| travel_to(Time.zone.parse("2026-06-04T10:00:00Z")) { example.run } }
+
+    context "when the subscription has already started" do
+      let(:subscription) { build(:subscription, started_at: Time.zone.parse("2026-03-03T00:00:00Z")) }
+
+      it "returns the current time" do
+        expect(subscription.billing_reference_time).to eq(Time.current)
+      end
+    end
+
+    context "when the subscription starts in the future" do
+      let(:subscription) { build(:subscription, started_at: Time.zone.parse("2026-07-03T00:00:00Z")) }
+
+      it "returns started_at" do
+        expect(subscription.billing_reference_time).to eq(subscription.started_at)
+      end
+    end
+
+    context "when started_at is nil" do
+      let(:subscription) { build(:subscription, started_at: nil) }
+
+      it "falls back to the current time" do
+        expect(subscription.billing_reference_time).to eq(Time.current)
+      end
+    end
+  end
+
   describe "#initial_started_at" do
     let(:customer) { create(:customer) }
     let(:subscription) do
@@ -576,6 +789,63 @@ RSpec.describe Subscription do
     context "without pending next subscription" do
       it "returns nil" do
         create(:subscription, previous_subscription: subscription, status: :active)
+        expect(subscription.downgrade_plan_date).to be_nil
+      end
+    end
+
+    context "with active downgraded next subscription" do
+      let(:plan) { create(:plan, amount_cents: 200) }
+      let(:next_plan) { create(:plan, amount_cents: 100) }
+      let(:subscription) { create(:subscription, :terminated, plan:) }
+
+      it "returns the date when the plan was downgraded" do
+        create(
+          :subscription,
+          previous_subscription: subscription,
+          plan: next_plan,
+          status: :active,
+          started_at: Time.zone.parse("2022-07-01T00:00:00Z")
+        )
+
+        expect(subscription.downgrade_plan_date).to eq(Date.parse("1 Jul 2022"))
+      end
+    end
+
+    context "with anniversary billing before the downgrade date" do
+      let(:started_at) { Time.zone.parse("2022-06-04T00:00:00Z") }
+      let(:subscription) do
+        create(
+          :subscription,
+          :anniversary,
+          started_at:,
+          subscription_at: started_at
+        )
+      end
+
+      it "returns the next anniversary date" do
+        create(:subscription, previous_subscription: subscription, status: :pending)
+
+        travel_to(Time.zone.parse("2022-07-03T00:00:00Z")) do
+          expect(subscription.downgrade_plan_date).to eq(Date.parse("4 Jul 2022"))
+        end
+      end
+    end
+
+    context "with a product-catalog plan" do
+      let(:plan) do
+        create(:plan, pricing_type: "product_catalog", interval: nil, amount_cents: nil, pay_in_advance: nil)
+      end
+      let(:subscription) { create(:subscription, plan:) }
+
+      it "returns nil rather than deriving a plan-level period" do
+        create(:subscription, previous_subscription: subscription, status: :pending)
+
+        expect(subscription.downgrade_plan_date).to be_nil
+      end
+
+      it "returns nil without comparing plan amounts when the next subscription is active" do
+        create(:subscription, previous_subscription: subscription, status: :active)
+
         expect(subscription.downgrade_plan_date).to be_nil
       end
     end

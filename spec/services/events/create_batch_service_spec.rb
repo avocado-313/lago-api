@@ -247,7 +247,7 @@ RSpec.describe Events::CreateBatchService do
         result = create_batch_service.call
 
         expect(result).to be_success
-        expect(result.events.first.timestamp).to eq(Time.zone.at(timestamp.to_f))
+        expect(result.events.first.timestamp).to eq(Time.zone.at(BigDecimal(timestamp)))
       end
     end
 
@@ -261,7 +261,7 @@ RSpec.describe Events::CreateBatchService do
     end
 
     context "with an expression configured on the billable metric" do
-      let(:billable_metric) { create(:billable_metric, code:, organization:, field_name: "result", expression: "concat(event.properties.foo, '-bar')") }
+      let(:billable_metric) { create(:sum_billable_metric, code:, organization:, field_name: "result", expression: "concat(event.properties.foo, '-bar')") }
 
       before do
         billable_metric
@@ -295,6 +295,26 @@ RSpec.describe Events::CreateBatchService do
       end
     end
 
+    context "when timestamp is sent with decimal fractions represented by repeating floats" do
+      let(:timestamps) { %w[1780586634.1 1780586634.2 1780586634.3] }
+      let(:events_params) do
+        build_params(count: timestamps.count) do |event, index|
+          event[:timestamp] = timestamps[index]
+        end
+      end
+
+      it "creates events with the received timestamp precision" do
+        result = create_batch_service.call
+
+        expect(result).to be_success
+        expect(result.events.map { |event| event.timestamp.iso8601(9) }).to eq([
+          "2026-06-04T15:23:54.100000000Z",
+          "2026-06-04T15:23:54.200000000Z",
+          "2026-06-04T15:23:54.300000000Z"
+        ])
+      end
+    end
+
     context "when kafka is configured", :capture_kafka_messages do
       let(:events_params) { build_params(count: 2) }
 
@@ -319,7 +339,7 @@ RSpec.describe Events::CreateBatchService do
               expected_params = events_params[:events][index]
 
               expect(message[:topic]).to eq("raw_events")
-              expect(message[:key]).to eq("#{organization.id}-#{external_subscription_id}")
+              expect(message).not_to have_key(:key)
 
               payload = JSON.parse(message[:payload])
               expect(payload["organization_id"]).to eq(organization.id)
@@ -329,7 +349,7 @@ RSpec.describe Events::CreateBatchService do
               expect(payload["precise_total_amount_cents"]).to eq(precise_total_amount_cents)
               expect(payload["properties"]).to eq(expected_params[:properties].stringify_keys)
               expect(payload["timestamp"]).to eq(timestamp.to_s)
-              expect(payload["ingested_at"]).to eq(Time.zone.now.iso8601[...-1])
+              expect(payload["ingested_at"]).to eq(Time.zone.now.iso8601(3)[...-1])
               expect(payload["source"]).to eq("http_ruby")
               expect(payload["source_metadata"]).to eq({"api_post_processed" => true})
             end

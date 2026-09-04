@@ -86,6 +86,22 @@ RSpec.describe Invoices::RetryService do
       end
     end
 
+    context "when the invoice was closed after it was loaded" do
+      before do
+        # Cancelling a gated subscription closes the invoice without touching this instance,
+        # which still believes it is failed.
+        Invoice.where(id: invoice.id).update_all(status: :closed) # rubocop:disable Rails/SkipsModelValidations
+      end
+
+      it "does not reopen it" do
+        result = retry_service.call
+
+        expect(result).not_to be_success
+        expect(result.error.code).to eq("invalid_status")
+        expect(invoice.reload).to be_closed
+      end
+    end
+
     it "enqueues a Invoices::ProviderTaxes::PullTaxesAndApplyJob" do
       expect do
         retry_service.call
@@ -97,6 +113,29 @@ RSpec.describe Invoices::RetryService do
 
       expect(invoice.reload.status).to eq("pending")
       expect(invoice.reload.tax_status).to eq("pending")
+    end
+
+    context "when invoice is subscription_gated" do
+      let(:gated_subscription) do
+        create(
+          :subscription, :incomplete, :with_activation_rules,
+          activation_rules_config: [{type: :payment, timeout_hours: 48, status: :pending}],
+          customer:, organization:
+        )
+      end
+
+      before do
+        create(:invoice_subscription, invoice:, subscription: gated_subscription)
+        invoice.update!(status: :failed)
+      end
+
+      it "sets invoice status to open instead of pending" do
+        retry_service.call
+        invoice.reload
+
+        expect(invoice).to be_open
+        expect(invoice).to be_tax_pending
+      end
     end
   end
 end

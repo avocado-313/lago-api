@@ -13,7 +13,9 @@ module Api
           timestamp: Time.current.to_i,
           skip_psp: create_params[:skip_psp],
           invoice_custom_section: create_params[:invoice_custom_section] || {},
-          payment_method_params: create_params[:payment_method]
+          payment_method_params: create_params[:payment_method],
+          billing_entity_code: create_params[:billing_entity_code],
+          purchase_order_number: create_params[:purchase_order_number]
         )
 
         if result.success?
@@ -25,6 +27,8 @@ module Api
 
       def update
         invoice = current_organization.invoices.visible.find_by(id: params[:id])
+
+        return method_not_allowed_error(code: "update_on_voided_invoice") if invoice&.voided?
 
         result = Invoices::UpdateService.new(
           invoice:,
@@ -119,6 +123,17 @@ module Api
         invoice = current_organization.invoices.visible.find_by(id: params[:id])
 
         result = Invoices::VoidService.call(invoice: invoice, params: void_params)
+        if result.success?
+          render_invoice(result.invoice)
+        else
+          render_error_response(result)
+        end
+      end
+
+      def destroy
+        invoice = current_organization.invoices.visible.find_by(id: params[:id])
+
+        result = Invoices::DeleteService.call(invoice:)
         if result.success?
           render_invoice(result.invoice)
         else
@@ -275,6 +290,8 @@ module Api
               :external_customer_id,
               :currency,
               :skip_psp,
+              :billing_entity_code,
+              :purchase_order_number,
               fees: [
                 :add_on_code,
                 :invoice_display_name,

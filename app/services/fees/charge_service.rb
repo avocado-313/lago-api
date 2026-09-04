@@ -2,62 +2,53 @@
 
 module Fees
   class ChargeService < BaseService
-    # optional params:
-    # | usage_filters - UsageFilters
-    #  - context (:current_usage, :invoice_preview, :recurring) - to be moved in usage_filters
-    # | results_adjustments - to be implemented as a class to pass the following inside:
-    #  - with_zero_units_filters
-    #  - calculate_projected_usage
-    #  - apply_taxes
-    #  - filtered_aggregations
+    Result = BaseResult[:fees, :cached_aggregations]
+
     def initialize(
       invoice:,
-      charge:,
+      metered_item:,
       subscription:,
-      boundaries:,
-      context: nil,
       cache_middleware: nil,
       filtered_aggregations: nil,
-      apply_taxes: false,
-      calculate_projected_usage: false,
-      with_zero_units_filters: true,
-      usage_filters: UsageFilters::NONE
+      options: nil,
+      plan: nil,
+      customer: nil
     )
       @invoice = invoice
-      @charge = charge
+      @metered_item = metered_item
       @subscription = subscription
-      @boundaries = boundaries
-      @currency = subscription.plan.amount.currency
-      @apply_taxes = apply_taxes
-      @calculate_projected_usage = calculate_projected_usage
-      @with_zero_units_filters = with_zero_units_filters
-      @context = context
-      @current_usage = context == :current_usage
-      @cache_middleware = cache_middleware || Subscriptions::ChargeCacheMiddleware.new(
-        subscription:, charge:, to_datetime: boundaries.charges_to_datetime, cache: false
-      )
+      @options = options || Options.default
+      @plan = plan
+      @customer = customer
 
-      # Allow the service to ignore events aggregation
+      validate!
+
+      @cache_middleware = cache_middleware || Subscriptions::ChargeCacheMiddleware.new(
+        subscription:,
+        charge: metered_item.charge,
+        to_datetime: metered_item.boundaries.charges_to_datetime,
+        cache: false
+      )
       @filtered_aggregations = filtered_aggregations
-      @usage_filters = usage_filters
 
       super(nil)
     end
 
     def call
-      return result if !current_usage && already_billed?
+      return result if !options.current_usage? && already_billed?
 
-      init_fees
-      return result if current_usage
+      init_metered_items_fees
+      return result if options.current_usage?
 
       if invoice.nil? || !invoice.progressive_billing?
         init_true_up_fee
       end
+
       return result unless result.success?
 
       ActiveRecord::Base.transaction do
         result.fees.reject! { |f| !should_persist_fee?(f, result.fees) }
-        next if context == :invoice_preview
+        next if options.invoice_preview?
 
         result.fees.each do |fee|
           fee.save!
@@ -78,77 +69,179 @@ module Fees
 
     private
 
-    attr_accessor :invoice, :charge, :subscription, :boundaries, :context, :current_usage, :currency, :cache_middleware,
-      :filtered_aggregations, :apply_taxes, :calculate_projected_usage, :with_zero_units_filters, :usage_filters
+    attr_reader :invoice, :metered_item, :subscription, :cache_middleware, :filtered_aggregations, :options, :plan, :customer
 
-    delegate :billable_metric, to: :charge
-    delegate :organization, to: :subscription
-    delegate :plan, to: :subscription
-
-    def init_fees
+    def init_metered_items_fees
       result.fees = []
 
-      return init_charge_fees(properties: charge.properties) unless charge.filters.any?
+      return init_fees(selected_metered_item: metered_item) unless metered_item.charge.filters.any?
 
       # NOTE: Create a fee for each filters defined on the charge.
-      charge.filters.each do |charge_filter|
-        init_charge_fees(properties: charge_filter.properties, charge_filter:)
+      metered_item.charge.filters.each do |charge_filter|
+        filter_metered_item = metered_item.with_charge_filter(charge_filter)
+        init_fees(selected_metered_item: filter_metered_item)
       end
 
       # NOTE: Create a fee for events not matching any filters.
-      charge_filter = ChargeFilter.new(charge:, properties: {"pricing_group_keys" => charge.pricing_group_keys})
-      init_charge_fees(properties: charge.properties, charge_filter:)
+      charge_filter = ChargeFilter.new(
+        charge: metered_item.charge,
+        properties: {"pricing_group_keys" => metered_item.charge.pricing_group_keys}
+      )
+
+      init_fees(
+        selected_metered_item: metered_item.with_charge_filter(
+          charge_filter,
+          properties: metered_item.charge.properties
+        )
+      )
     end
 
-    def init_charge_fees(properties:, charge_filter: nil)
-      fees = cache_middleware.call(charge_filter:) do
-        charge_model_result = apply_aggregation_and_charge_model(properties:, charge_filter:)
-
-        unless charge_model_result.success?
-          result.fail_with_error!(charge_model_result.error)
-          return []
-        end
-
-        charge_fees = fees_from_charge_model_result(charge_model_result, properties:, charge_filter:)
-
-        filter_non_persistable_fees_for_caching(charge_fees)
+    def init_fees(selected_metered_item:)
+      if skip_unused_filter?(selected_metered_item)
+        fees = []
+      else
+        fees = compute_fees_with_cache(selected_metered_item:)
+        # NOTE: nil means the aggregation or the charge model failed, result carries the error
+        return if fees.nil?
       end
 
       if fees.empty? && skip_caching_of_non_persistable_fee?
-        fees = hydrate_non_persistable_fees(properties:, charge_filter:)
+        fees = hydrate_non_persistable_fees(selected_metered_item:)
       end
 
-      # Preserve preloaded billable_metric on all fees (including cached ones) to avoid N+1 queries
-      fees.each { |fee| fee.association(:billable_metric).target = billable_metric }
+      # Preserve preloaded associations on all fees (including cached ones) to avoid N+1 queries
+      fees.each do |fee|
+        fee.association(:billable_metric).target = selected_metered_item.billable_metric
+        if selected_metered_item.charge_filter&.id
+          fee.association(:charge_filter).target = selected_metered_item.charge_filter
+        end
+        fee.association(:charge).target = selected_metered_item.charge
+      end
 
       result.fees.concat(fees.compact)
     end
 
-    def skip_caching_of_non_persistable_fee?
-      current_usage && organization.feature_flag_enabled?(:non_persistable_charge_cache_optimization)
+    # NOTE: When the billing period pre-filtering (Events::BillingPeriodFilterService) reports
+    #       that no event matches this filter in the period, the fee can only have zero units.
+    #       The cache round-trip and the bypassed aggregation are skipped and the zero-units fee
+    #       is hydrated in memory instead. Scoped to current usage: on invoicing, adjusted fees
+    #       on draft invoices can target filters without any usage.
+    #       Recurring metrics always aggregate as usage carries over from previous periods.
+    def skip_unused_filter?(selected_metered_item)
+      return false unless options.current_usage?
+      return false if filtered_aggregations.nil?
+      return false if selected_metered_item.billable_metric.recurring?
+
+      !filtered_aggregations.include?(selected_metered_item.charge_filter&.id)
     end
 
-    def hydrate_non_persistable_fees(properties:, charge_filter:)
-      zero_aggregation = BillableMetrics::Aggregations::BaseService.null_result(grouped_by_keys: grouped_by_keys(charge_filter:), apply_aggregation: true)
+    def compute_fees_with_cache(selected_metered_item:)
+      cache_middleware.call(charge_filter: selected_metered_item.charge_filter) do
+        aggregation_result = aggregator(selected_metered_item:).aggregate(
+          options: selected_metered_item.aggregation_options(current_usage: options.current_usage?)
+        )
+
+        unless aggregation_result.success?
+          result.fail_with_error!(aggregation_result.error)
+          return
+        end
+
+        charge_model_result = apply_charge_model(aggregation_result:, selected_metered_item:)
+        unless charge_model_result.success?
+          result.fail_with_error!(charge_model_result.error)
+          return
+        end
+
+        breakdowns_by_group = breakdowns_by_grouped_by(aggregation_result.breakdowns, charge_model_result)
+
+        if selected_metered_item.billable_metric.recurring?
+          persist_recurring_value(
+            aggregation_result.aggregations || [aggregation_result],
+            selected_metered_item,
+            breakdowns_by_group
+          )
+        end
+
+        charge_fees = fees_from_charge_model_result(
+          charge_model_result,
+          selected_metered_item:,
+          breakdowns_by_group:
+        )
+
+        filter_non_persistable_fees_for_caching(charge_fees)
+      end
+    end
+
+    def skip_caching_of_non_persistable_fee?
+      options.current_usage?
+    end
+
+    def hydrate_non_persistable_fees(selected_metered_item:)
+      zero_aggregation = aggregator(selected_metered_item:).empty_results
 
       charge_model_result = ChargeModels::Factory.new_instance(
-        chargeable: charge,
+        pricing_structure: selected_metered_item.pricing_structure,
         aggregation_result: zero_aggregation,
-        properties:,
-        period_ratio: calculate_period_ratio,
-        calculate_projected_usage:
+        period_ratio: selected_metered_item.period_ratio,
+        calculate_projected_usage: options.calculate_projected_usage
       ).apply
 
-      fees_from_charge_model_result(charge_model_result, properties:, charge_filter:)
+      fees_from_charge_model_result(charge_model_result, selected_metered_item:, breakdowns_by_group: {})
     end
 
-    def fees_from_charge_model_result(charge_model_result, properties:, charge_filter:)
+    def fees_from_charge_model_result(charge_model_result, selected_metered_item:, breakdowns_by_group:)
       charge_model_result.grouped_results.map do |amount_result|
         # TODO: check if this is still needed as we now skip certain zero units fees
-        next if current_usage && charge_filter && amount_result.units.zero? && !with_zero_units_filters
+        if options.current_usage? && selected_metered_item.charge_filter && amount_result.units.zero? && !options.with_zero_units_filters
+          next
+        end
 
-        init_fee(amount_result, properties:, charge_filter:)
+        adjusted = applicable_adjusted_fee(amount_result:, selected_metered_item:)
+        fee = init_fee(amount_result, selected_metered_item:, adjusted:)
+        next if fee.nil?
+
+        if adjusted.nil? || amount_result.units == fee.units
+          build_breakdowns_for_fee(fee:, breakdowns_by_group:)
+        end
+
+        fee
       end.compact
+    end
+
+    def applicable_adjusted_fee(amount_result:, selected_metered_item:)
+      return nil if options.current_usage?
+      return nil unless invoice&.draft?
+
+      adjusted = adjusted_fee(charge_filter: selected_metered_item.charge_filter, grouped_by: amount_result.grouped_by)
+      return nil if adjusted.nil? || adjusted.adjusted_display_name?
+
+      adjusted
+    end
+
+    def build_breakdowns_for_fee(fee:, breakdowns_by_group:)
+      grouped_by = fee.grouped_by
+
+      (breakdowns_by_group[grouped_by] || []).map do |breakdown|
+        fee.presentation_breakdowns.build(
+          presentation_by: breakdown[:groups],
+          units: breakdown[:value],
+          organization_id: metered_item.organization_id
+        )
+      end
+    end
+
+    def breakdowns_by_grouped_by(breakdowns, charge_model_result)
+      charge_model_result.grouped_results.each_with_object({}) do |grouped_result, memo|
+        grouped_by = grouped_result.grouped_by || {}
+        next if memo.key?(grouped_by)
+
+        grouped_by_keys = grouped_by.keys
+        memo[grouped_by] = Array(breakdowns)
+          .lazy
+          .select { |b| b[:groups].slice(*grouped_by_keys) == grouped_by }
+          .map { |b| {groups: b[:groups].except(*grouped_by_keys), value: b[:value]} }
+          .to_a
+      end
     end
 
     def filter_non_persistable_fees_for_caching(charge_fees)
@@ -157,22 +250,21 @@ module Fees
       charge_fees.filter { |f| should_persist_fee?(f, charge_fees) }
     end
 
-    def init_fee(amount_result, properties:, charge_filter:)
-      # NOTE: Build fee for case when there is adjusted fee and units or amount has been adjusted.
+    def init_fee(amount_result, selected_metered_item:, adjusted:)
+      # NOTE: Build fee for case when there is adjusted fee and units or amount has been adjusted (see applicable_adjusted_fee method).
       # Base fee creation flow handles case when only name has been adjusted
-      if !current_usage && invoice&.draft? && (adjusted = adjusted_fee(
-        charge_filter:,
-        grouped_by: amount_result.grouped_by
-      )) && !adjusted.adjusted_display_name?
+      if adjusted
         adjustement_result = Fees::InitFromAdjustedChargeFeeService.call(
           adjusted_fee: adjusted,
-          boundaries:,
-          properties:
+          boundaries: selected_metered_item.boundaries,
+          properties: selected_metered_item.properties
         )
-        return result.fail_with_error!(adjustement_result.error) unless adjustement_result.success?
+        unless adjustement_result.success?
+          result.fail_with_error!(adjustement_result.error)
+          return nil
+        end
 
-        result.fees << adjustement_result.fee
-        return
+        return adjustement_result.fee
       end
 
       # Prevent trying to create a fee with negative units or amount.
@@ -183,28 +275,28 @@ module Fees
 
       # NOTE: amount_result should be a BigDecimal, we need to round it
       # to the currency decimals and transform it into currency cents
-      if charge.applied_pricing_unit
+      if selected_metered_item.applied_pricing_unit
         pricing_unit_usage = PricingUnitUsage.build_from_fiat_amounts(
           amount: amount_result.amount,
           unit_amount: amount_result.unit_amount,
-          applied_pricing_unit: charge.applied_pricing_unit
+          applied_pricing_unit: selected_metered_item.applied_pricing_unit
         )
 
         amount_cents, precise_amount_cents, unit_amount_cents, precise_unit_amount = pricing_unit_usage
-          .to_fiat_currency_cents(currency)
+          .to_fiat_currency_cents(selected_metered_item.currency)
           .values_at(:amount_cents, :precise_amount_cents, :unit_amount_cents, :precise_unit_amount)
       else
         pricing_unit_usage = nil
-        rounded_amount = amount_result.amount.round(currency.exponent)
-        amount_cents = rounded_amount * currency.subunit_to_unit
-        precise_amount_cents = amount_result.amount * currency.subunit_to_unit.to_d
-        unit_amount_cents = amount_result.unit_amount * currency.subunit_to_unit
+        rounded_amount = amount_result.amount.round(selected_metered_item.currency.exponent)
+        amount_cents = rounded_amount * selected_metered_item.currency.subunit_to_unit
+        precise_amount_cents = amount_result.amount * selected_metered_item.currency.subunit_to_unit.to_d
+        unit_amount_cents = amount_result.unit_amount * selected_metered_item.currency.subunit_to_unit
         precise_unit_amount = amount_result.unit_amount
       end
 
-      units = if current_usage && (charge.pay_in_advance? || charge.prorated?)
+      units = if options.current_usage? && (selected_metered_item.pay_in_advance? || selected_metered_item.prorated?)
         amount_result.current_usage_units
-      elsif charge.prorated?
+      elsif selected_metered_item.prorated?
         amount_result.full_units_number.nil? ? amount_result.units : amount_result.full_units_number
       else
         amount_result.units
@@ -212,19 +304,19 @@ module Fees
 
       new_fee = Fee.new(
         invoice:,
-        organization_id: organization.id,
-        billing_entity_id: subscription.customer.billing_entity_id,
+        organization_id: subscription.organization_id,
+        billing_entity_id: subscription.applicable_billing_entity_id,
         subscription:,
-        charge:,
+        charge: selected_metered_item.charge,
         amount_cents:,
         precise_amount_cents:,
-        amount_currency: currency,
+        amount_currency: selected_metered_item.currency,
         fee_type: :charge,
         invoiceable_type: "Charge",
-        invoiceable: charge,
+        invoiceable: selected_metered_item.charge,
         units:,
         total_aggregated_units: amount_result.total_aggregated_units || units,
-        properties: filtered_for_charge_boundaries(boundaries.to_h),
+        properties: selected_metered_item.filtered_for_charge_boundaries,
         events_count: amount_result.count,
         payment_status: :pending,
         taxes_amount_cents: 0,
@@ -233,20 +325,20 @@ module Fees
         precise_unit_amount:,
         amount_details: amount_result.amount_details,
         grouped_by: amount_result.grouped_by || {},
-        charge_filter_id: charge_filter&.id,
+        charge_filter: selected_metered_item.charge_filter&.persisted? ? selected_metered_item.charge_filter : nil,
         pricing_unit_usage:
       )
 
-      unless charge.invoiceable?
-        new_fee.pay_in_advance = charge.pay_in_advance?
+      unless selected_metered_item.invoiceable?
+        new_fee.pay_in_advance = selected_metered_item.pay_in_advance?
       end
 
-      if !current_usage && (adjusted = adjusted_fee(charge_filter:, grouped_by: amount_result.grouped_by))&.adjusted_display_name?
+      if !options.current_usage? && (adjusted = adjusted_fee(charge_filter: selected_metered_item.charge_filter, grouped_by: amount_result.grouped_by))&.adjusted_display_name?
         new_fee.invoice_display_name = adjusted.invoice_display_name
       end
 
-      if apply_taxes
-        taxes_result = Fees::ApplyTaxesService.call(fee: new_fee)
+      if options.apply_taxes
+        taxes_result = Fees::ApplyTaxesService.call(fee: new_fee, plan:, customer:)
         taxes_result.raise_if_error!
       end
 
@@ -254,7 +346,7 @@ module Fees
     end
 
     def should_persist_fee?(fee, fees)
-      return true if context == :recurring
+      return true if options.recurring?
       return true if fee.units != 0 || fee.amount_cents != 0 || fee.events_count != 0
       return true if adjusted_fee(charge_filter: fee.charge_filter, grouped_by: fee.grouped_by).present?
       return true if fee.true_up_parent_fee.present?
@@ -263,6 +355,7 @@ module Fees
     end
 
     def adjusted_fee(charge_filter:, grouped_by:)
+      return if options.skip_adjusted_fees
       @adjusted_fee ||= {}
 
       key = [
@@ -276,9 +369,9 @@ module Fees
       return @adjusted_fee[key] if @adjusted_fee.key?(key)
 
       scope = AdjustedFee
-        .where(invoice:, subscription:, charge:, charge_filter:, fee_type: :charge)
-        .where("(properties->>'charges_from_datetime')::timestamptz = ?", boundaries.charges_from_datetime&.iso8601(3))
-        .where("(properties->>'charges_to_datetime')::timestamptz = ?", boundaries.charges_to_datetime&.iso8601(3))
+        .where(invoice:, subscription:, charge: metered_item.charge, charge_filter:, fee_type: :charge)
+        .where("(properties->>'charges_from_datetime')::timestamptz = ?", metered_item.boundaries.charges_from_datetime&.iso8601(3))
+        .where("(properties->>'charges_to_datetime')::timestamptz = ?", metered_item.boundaries.charges_to_datetime&.iso8601(3))
 
       scope = if grouped_by.present?
         scope.where(grouped_by:)
@@ -292,7 +385,7 @@ module Fees
     def init_true_up_fee
       fee = result.fees.find { |f| f.charge_filter_id.nil? }
 
-      if charge.applied_pricing_unit
+      if metered_item.applied_pricing_unit
         used_amount_cents = result.fees.map(&:pricing_unit_usage).sum(&:amount_cents)
         used_precise_amount_cents = result.fees.map(&:pricing_unit_usage).sum(&:precise_amount_cents)
       else
@@ -304,45 +397,28 @@ module Fees
       result.fees << true_up_fee if true_up_fee
     end
 
-    def apply_aggregation_and_charge_model(properties:, charge_filter: nil)
-      aggregation_result = aggregator(charge_filter:).aggregate(options: options(properties))
-      return aggregation_result unless aggregation_result.success?
-
-      if billable_metric.recurring?
-        persist_recurring_value(aggregation_result.aggregations || [aggregation_result], charge_filter)
-      end
-
+    def apply_charge_model(aggregation_result:, selected_metered_item:)
       ChargeModels::Factory.new_instance(
-        chargeable: charge,
+        pricing_structure: selected_metered_item.pricing_structure,
         aggregation_result:,
-        properties:,
-        period_ratio: calculate_period_ratio,
-        calculate_projected_usage:
+        period_ratio: selected_metered_item.period_ratio,
+        calculate_projected_usage: options.calculate_projected_usage
       ).apply
-    end
-
-    def options(properties)
-      {
-        free_units_per_events: properties["free_units_per_events"].to_i,
-        free_units_per_total_aggregation: BigDecimal(properties["free_units_per_total_aggregation"] || 0),
-        is_current_usage: current_usage,
-        is_pay_in_advance: charge.pay_in_advance?
-      }
     end
 
     def already_billed?
       existing_fees = if invoice
-        invoice.fees.where(charge_id: charge.id, subscription_id: subscription.id)
+        invoice.fees.where(charge_id: metered_item.charge.id, subscription_id: subscription.id)
       else
         Fee.where(
-          charge_id: charge.id,
+          charge_id: metered_item.charge.id,
           subscription_id: subscription.id,
           invoice_id: nil,
           pay_in_advance_event_id: nil
         ).where(
-          "(properties->>'charges_from_datetime')::timestamptz = ?", boundaries.charges_from_datetime&.iso8601(3)
+          "(properties->>'charges_from_datetime')::timestamptz = ?", metered_item.boundaries.charges_from_datetime&.iso8601(3)
         ).where(
-          "(properties->>'charges_to_datetime')::timestamptz = ?", boundaries.charges_to_datetime&.iso8601(3)
+          "(properties->>'charges_to_datetime')::timestamptz = ?", metered_item.boundaries.charges_to_datetime&.iso8601(3)
         )
       end
 
@@ -352,27 +428,27 @@ module Fees
       true
     end
 
-    def aggregator(charge_filter:)
+    def aggregator(selected_metered_item:)
       aggregate = true
-      aggregate = filtered_aggregations.include?(charge_filter&.id) unless filtered_aggregations.nil?
+      aggregate = filtered_aggregations.include?(selected_metered_item.charge_filter&.id) unless filtered_aggregations.nil?
 
       BillableMetrics::AggregationFactory.new_instance(
-        charge:,
-        current_usage:,
+        charge: selected_metered_item.charge,
+        current_usage: options.current_usage?,
         subscription:,
         boundaries: {
-          from_datetime: boundaries.charges_from_datetime,
-          to_datetime: boundaries.charges_to_datetime,
-          charges_duration: boundaries.charges_duration,
-          max_timestamp: boundaries.max_timestamp
+          from_datetime: selected_metered_item.boundaries.charges_from_datetime,
+          to_datetime: selected_metered_item.boundaries.charges_to_datetime,
+          charges_duration: selected_metered_item.boundaries.charges_duration,
+          max_timestamp: selected_metered_item.boundaries.max_timestamp
         },
-        filters: aggregation_filters(charge_filter:),
+        filters: aggregation_filters(selected_metered_item:, bypass_aggregation: !aggregate),
         bypass_aggregation: !aggregate
       )
     end
 
-    def persist_recurring_value(aggregation_results, charge_filter)
-      return if current_usage
+    def persist_recurring_value(aggregation_results, selected_metered_item, breakdowns_by_group)
+      return if options.current_usage?
 
       # NOTE: Only weighted sum and custom aggregations are setting this value
       return unless aggregation_results.first&.recurring_updated_at
@@ -381,79 +457,84 @@ module Fees
 
       # NOTE: persist current recurring value for next period
       aggregation_results.each do |aggregation_result|
+        grouped_by = aggregation_result.grouped_by || {}
+
         result.cached_aggregations << CachedAggregation.find_or_initialize_by(
-          organization_id: billable_metric.organization_id,
+          organization_id: selected_metered_item.organization_id,
           external_subscription_id: subscription.external_id,
-          charge_id: charge.id,
-          charge_filter_id: charge_filter&.id,
-          grouped_by: aggregation_result.grouped_by || {},
+          charge_id: selected_metered_item.charge.id,
+          charge_filter_id: selected_metered_item.charge_filter&.id,
+          grouped_by:,
           timestamp: aggregation_result.recurring_updated_at
         ) do |aggregation|
           aggregation.current_aggregation = aggregation_result.total_aggregated_units || aggregation_result.aggregation
           aggregation.current_amount = aggregation_result.custom_aggregation&.[](:amount)
+          aggregation.presentation_breakdowns = breakdowns_by_group.fetch(grouped_by, [])
           aggregation.save!
         end
       end
     end
 
-    def grouped_by_keys(charge_filter: nil)
-      model = charge_filter.presence || charge
-      grouped_by_keys = model.pricing_group_keys&.dup || []
-      if charge.accepts_target_wallet && !grouped_by_keys.include?("target_wallet_code")
-        grouped_by_keys << "target_wallet_code"
-      end
-      grouped_by_keys if grouped_by_keys.present? && !usage_filters.skip_grouping
+    def grouped_by_keys(selected_metered_item:)
+      grouped_by_keys = selected_metered_item.pricing_group_keys
+      grouped_by_keys if grouped_by_keys.present? && !options.usage_filters.skip_grouping
     end
 
-    def aggregation_filters(charge_filter: nil)
-      filters = {charge_id: charge.id}
+    def aggregation_filters(selected_metered_item:, bypass_aggregation: false)
+      filters = {charge_id: selected_metered_item.charge.id}
 
-      grouped_by_keys = grouped_by_keys(charge_filter:)
+      grouped_by_keys = grouped_by_keys(selected_metered_item:)
       filters[:grouped_by] = grouped_by_keys if grouped_by_keys.present?
 
-      if charge_filter.present?
-        result = ChargeFilters::MatchingAndIgnoredService.call(charge:, filter: charge_filter)
-        filters[:charge_filter] = charge_filter
-        filters[:matching_filters] = result.matching_filters
-        filters[:ignored_filters] = result.ignored_filters
+      presentation_group_keys_values = selected_metered_item.presentation_group_keys_values
+      if presentation_group_keys_values.present?
+        filters[:presentation_by] = presentation_group_keys_values & (options.usage_filters.filter_by_presentation || presentation_group_keys_values)
       end
 
-      if usage_filters.filter_by_group.present?
+      if selected_metered_item.charge_filter.present?
+        filters[:charge_filter] = selected_metered_item.charge_filter
+
+        # NOTE: Matching and ignored filters are only used to filter events when querying the store.
+        #       When the aggregation is bypassed, no event is queried, so computing them is a waste
+        #       (see BillableMetrics::Aggregations::BaseService#should_bypass_aggregation?).
+        if !bypass_aggregation || selected_metered_item.billable_metric.recurring?
+          matching_and_ignored_filters = selected_metered_item.matching_and_ignored_filters
+          filters[:matching_filters] = matching_and_ignored_filters.matching_filters
+          filters[:ignored_filters] = matching_and_ignored_filters.ignored_filters
+        end
+      end
+
+      if options.usage_filters.filter_by_group.present?
         # when pricing group keys on a charge are "workspace" and "user", and filter_by_group is {"workspace" => ["A"]},
         # we want to remove the grouping keys "workspace", but keep the grouping key "user", so the usage will still be granular within the workspace
-        usage_filters.filter_by_group.keys.each { |key| filters[:grouped_by]&.delete(key) }
-        filters[:matching_filters] ||= {}
+        options.usage_filters.filter_by_group.keys.each { |key| filters[:grouped_by]&.delete(key) }
+        # NOTE: filters[:matching_filters] may come from ChargeFilter#to_h_with_all_values
+        # which returns a frozen hash, so we must not mutate it in place.
         # expected matching_filters format is { "workspace" => ["A", "B"], "user" => ["U1", "U2"] }
-        filters[:matching_filters].merge!(usage_filters.filter_by_group)
+        filters[:matching_filters] = (filters[:matching_filters] || {}).merge(options.usage_filters.filter_by_group)
       end
 
       filters
     end
 
-    def calculate_period_ratio
-      from_date = boundaries.charges_from_datetime.to_date
-      to_date = boundaries.charges_to_datetime.to_date
-      current_date = Time.current.to_date
+    def validate!
+      unless metered_item.is_a?(MeteredItem)
+        raise ArgumentError, "metered_item must be a Fees::ChargeService::MeteredItem"
+      end
 
-      total_days = (to_date - from_date).to_i + 1
+      unless options.is_a?(Options)
+        raise ArgumentError, "options must be a Fees::ChargeService::Options"
+      end
 
-      charges_duration = boundaries.charges_duration || total_days
+      return unless options.apply_taxes
 
-      return 1.0 if current_date >= to_date
-      return 0.0 if current_date < from_date
+      unless plan
+        raise ArgumentError, "plan is required when applying taxes"
+      end
 
-      days_passed = (current_date - from_date).to_i + 1
-
-      ratio = days_passed.fdiv(charges_duration)
-      ratio.clamp(0.0, 1.0)
-    end
-
-    def filtered_for_charge_boundaries(boundaries)
-      properties = boundaries.to_h
-      properties["fixed_charges_from_datetime"] = nil
-      properties["fixed_charges_to_datetime"] = nil
-      properties["fixed_charges_duration"] = nil
-      properties
+      unless customer
+        raise ArgumentError, "customer is required when applying taxes"
+      end
     end
   end
 end

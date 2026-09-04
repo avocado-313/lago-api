@@ -7,6 +7,7 @@ module BillableMetrics
         :aggregator, # Aggregator instance, used in some charge models
         :aggregations, # Array of aggregation result when in a grouped by scenario
         :aggregation, # Aggregation result computed using the event store
+        :breakdowns, # Array of breakdowns when presentation_by is used
         :grouped_by, # Pricing group keys applied to this aggregation result
         :current_usage_units, # Number of aggregated units when computing the current usage
         :count, # Number of events used to compute the aggregation
@@ -23,6 +24,7 @@ module BillableMetrics
         # Pay in advance fields
         :pay_in_advance_event, # Event that is triggering a pay in advance aggregation
         :pay_in_advance_aggregation, # Aggregation result for a single pay in advance event
+        :pay_in_advance_breakdowns, # Breakdown result for a single pay in advance event
         :pay_in_advance_precise_total_amount_cents, # Precise total amount in cents when in a pay in advance scenario
         # Cached aggregation fields
         :current_aggregation, # Current total aggregation cached in a pay in advance scenario (billing and current usage)
@@ -33,9 +35,9 @@ module BillableMetrics
       ]
       PerEventAggregationResult = BaseResult[:event_aggregation]
 
-      def self.null_result(result = BaseService::Result.new, grouped_by_keys: nil, apply_aggregation: false)
+      def self.null_result(result, grouped_by_keys: nil, apply_aggregation: false)
         if apply_aggregation && grouped_by_keys.present?
-          result.aggregations = [null_result(grouped_by_keys: grouped_by_keys)]
+          result.aggregations = [null_result(Result.new, grouped_by_keys: grouped_by_keys)]
         else
           result.grouped_by = grouped_by_keys.index_with { nil } if grouped_by_keys
           result.aggregation = 0
@@ -57,6 +59,8 @@ module BillableMetrics
         @event = filters[:event]
         @grouped_by = filters[:grouped_by]
         @grouped_by_values = filters[:grouped_by_values]
+        @presentation_by = filters[:presentation_by]
+        @uniq_grouped_by_and_presentation_by = ((grouped_by || []) + (presentation_by || [])).uniq
 
         @boundaries = boundaries
 
@@ -108,10 +112,21 @@ module BillableMetrics
       #   Used only for in advance billing
       def per_event_aggregation(exclude_event: false, include_event_value: false, grouped_by_values: nil)
         PerEventAggregationResult.new.tap do |result|
-          result.event_aggregation = event_store.with_grouped_by_values(grouped_by_values) do
-            compute_per_event_aggregation(exclude_event:, include_event_value:)
+          result.event_aggregation = if should_bypass_aggregation?
+            []
+          else
+            event_store.with_grouped_by_values(grouped_by_values) do
+              compute_per_event_aggregation(exclude_event:, include_event_value:)
+            end
           end
         end
+      end
+
+      # Exposes a null result that carries this aggregator instance, so downstream charge models
+      # can dispatch `per_event_aggregation` through the real aggregator rather than nil.
+      def empty_results
+        self.class.null_result(result, grouped_by_keys: grouped_by, apply_aggregation: true)
+        result
       end
 
       protected
@@ -125,7 +140,9 @@ module BillableMetrics
         :boundaries,
         :grouped_by,
         :grouped_by_values,
-        :bypass_aggregation
+        :presentation_by,
+        :bypass_aggregation,
+        :uniq_grouped_by_and_presentation_by
 
       delegate :billable_metric, to: :charge
 
@@ -142,6 +159,9 @@ module BillableMetrics
       end
 
       def deduplicate?
+        override = Events::Stores::StoreFactory.override
+        return override[:deduplicate] if override
+
         organization = subscription&.organization
         return false unless organization
 
@@ -160,6 +180,15 @@ module BillableMetrics
         return unless event
 
         (event.properties || {})[billable_metric.field_name] || 0
+      end
+
+      def build_pay_in_advance_breakdowns(value:)
+        return [] unless event
+        return [] if event.properties.blank?
+
+        groups = uniq_grouped_by_and_presentation_by.index_with { event.properties[it] }
+
+        [{groups:, value: BigDecimal(value.to_s)}]
       end
 
       def handle_in_advance_current_usage(total_aggregation, target_result: result)
@@ -193,11 +222,6 @@ module BillableMetrics
 
       def empty_result
         self.class.null_result(result)
-      end
-
-      def empty_results
-        self.class.null_result(result, grouped_by_keys: grouped_by, apply_aggregation: true)
-        result
       end
 
       # This method fetches the latest cached aggregation in current period. If such a record exists we know that

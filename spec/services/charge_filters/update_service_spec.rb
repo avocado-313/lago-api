@@ -6,7 +6,9 @@ RSpec.describe ChargeFilters::UpdateService do
   subject(:service) { described_class.call(charge_filter:, params:) }
 
   let(:charge) { create(:standard_charge) }
-  let(:charge_filter) { create(:charge_filter, charge:, invoice_display_name: "Original Name", properties: {"amount" => "10"}) }
+  let(:charge_filter) do
+    create(:charge_filter, charge:, invoice_display_name: "Original Name", properties: {"amount" => "10"}, code: "card_location_domestic_9f2a1c7b")
+  end
   let(:params) { {} }
 
   let(:card_location_filter) do
@@ -50,6 +52,20 @@ RSpec.describe ChargeFilters::UpdateService do
       end
     end
 
+    context "with presentation_group_keys in properties" do
+      let(:params) do
+        {
+          properties: {amount: "200", presentation_group_keys: [{value: "region"}]}
+        }
+      end
+
+      it "ignores presentation_group_keys" do
+        expect(service).to be_success
+        expect(charge_filter.reload.properties).to eq({"amount" => "200"})
+        expect(charge_filter.reload.properties).not_to have_key("presentation_group_keys")
+      end
+    end
+
     context "with graduated charge model" do
       let(:charge) { create(:graduated_charge) }
       let(:charge_filter) { create(:charge_filter, charge:, properties: {"graduated_ranges" => [{"from_value" => 0, "to_value" => nil, "per_unit_amount" => "0", "flat_amount" => "100"}]}) }
@@ -83,17 +99,19 @@ RSpec.describe ChargeFilters::UpdateService do
         create(:charge_filter_value, charge_filter:, billable_metric_filter: card_location_filter, values: ["domestic"])
         create(:subscription, plan: child_plan, status: :active)
         child_charge
-        allow(Charges::UpdateChildrenJob).to receive(:perform_later)
       end
 
-      it "triggers cascade update via Charges::UpdateChildrenJob" do
+      it "triggers filter-level cascade via ChargeFilters::CascadeJob" do
         service
 
-        expect(Charges::UpdateChildrenJob).to have_received(:perform_later).with(
-          params: hash_including("charge_model", "properties", "filters"),
-          old_parent_attrs: hash_including("id" => charge.id),
-          old_parent_filters_attrs: array_including(hash_including("id", "properties")),
-          old_parent_applied_pricing_unit_attrs: nil
+        expect(ChargeFilters::CascadeJob).to have_been_enqueued.with(
+          charge.id,
+          "update",
+          hash_including("card_location"),
+          hash_including("amount"),
+          hash_including("amount"),
+          anything,
+          "card_location_domestic_9f2a1c7b"
         )
       end
     end
@@ -107,13 +125,12 @@ RSpec.describe ChargeFilters::UpdateService do
         create(:charge_filter_value, charge_filter:, billable_metric_filter: card_location_filter, values: ["domestic"])
         create(:subscription, plan: child_plan, status: :active)
         child_charge
-        allow(Charges::UpdateChildrenJob).to receive(:perform_later)
       end
 
       it "does not trigger cascade update" do
         service
 
-        expect(Charges::UpdateChildrenJob).not_to have_received(:perform_later)
+        expect(ChargeFilters::CascadeJob).not_to have_been_enqueued
       end
     end
   end

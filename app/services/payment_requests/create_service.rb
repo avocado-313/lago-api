@@ -2,6 +2,8 @@
 
 module PaymentRequests
   class CreateService < BaseService
+    Result = BaseResult[:payment_request]
+
     def initialize(organization:, params:, dunning_campaign: nil)
       @organization = organization
       @params = params
@@ -63,6 +65,7 @@ module PaymentRequests
       # - there are no invoices
       # - the invoices are not overdue
       # - the invoices have different currencies
+      # - the invoices have different billing entities
       # - the invoices are not ready for payment processing
 
       return result.forbidden_failure! unless License.premium?
@@ -77,6 +80,10 @@ module PaymentRequests
         return result.not_allowed_failure!(code: "invoices_have_different_currencies")
       end
 
+      if invoices.pluck(:billing_entity_id).uniq.size > 1
+        return result.not_allowed_failure!(code: "invoices_have_different_billing_entities")
+      end
+
       if invoices.exists?(ready_for_payment_processing: false)
         result.not_allowed_failure!(code: "invoices_not_ready_for_payment_processing")
       end
@@ -87,7 +94,7 @@ module PaymentRequests
     end
 
     def invoices
-      @invoices ||= customer.invoices.where(id: params[:lago_invoice_ids])
+      @invoices ||= customer.invoices.where.not(status: :deleted).where(id: params[:lago_invoice_ids])
     end
 
     def email

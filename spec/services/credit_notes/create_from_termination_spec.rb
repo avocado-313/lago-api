@@ -42,6 +42,7 @@ RSpec.describe CreditNotes::CreateFromTermination do
   let(:tax) { create(:tax, organization:, rate: tax_rate) }
   let(:tax_rate) { 20 }
   let(:coupon_amount) { 0 }
+  let(:invoice_purchase_order_number) { nil }
 
   let(:fee_and_invoice) { generate_invoice_and_fee(plan_amount_cents) }
   let(:invoice) { fee_and_invoice[:invoice] }
@@ -68,6 +69,7 @@ RSpec.describe CreditNotes::CreateFromTermination do
       total_amount_cents: total_amount_cents,
       total_paid_amount_cents: paid_amount,
       payment_status: ((paid_amount == total_amount_cents) ? :succeeded : :pending),
+      purchase_order_number: invoice_purchase_order_number,
       created_at: at
     )
     create(:invoice_applied_tax, invoice:, tax:, tax_rate: tax.rate, amount_cents: invoice_taxes_amount_cents)
@@ -206,6 +208,22 @@ RSpec.describe CreditNotes::CreateFromTermination do
         precise_item_amount_cents: 16_00,
         tax_amount_cents: 3_20
       })
+    end
+
+    context "when the parent invoice has a purchase order number" do
+      let(:invoice_purchase_order_number) { "PO-123" }
+
+      it "exposes the parent invoice purchase order number" do
+        credit_note = test_credit_note_creation_from_termination(expectations: {
+          total_amount_cents: 19_20,
+          credit_amount_cents: 19_20,
+          precise_item_amount_cents: 16_00,
+          tax_amount_cents: 3_20
+        })
+
+        expect(credit_note.invoice.purchase_order_number).to eq("PO-123")
+        expect(credit_note.purchase_order_number).to eq("PO-123")
+      end
     end
 
     context "with amount details attached to the fee" do
@@ -1171,6 +1189,22 @@ RSpec.describe CreditNotes::CreateFromTermination do
 
       it "does not persist any credit note item" do
         expect { create_service.call }.not_to change(CreditNoteItem, :count)
+      end
+    end
+
+    context "when invoice is tax_pending and context is :preview" do
+      # NOTE: Real termination is blocked upstream by Subscriptions::TerminateService.
+      #       Preview is exempt so the dashboard can still render the credit note;
+      #       CreditNotes::CreateService#credit_note_status forces :finalized in that case.
+      let(:context) { :preview }
+
+      before { invoice.update!(status: :pending, tax_status: :pending) }
+
+      it "builds a credit note without error" do
+        result = create_service.call
+
+        expect(result).to be_success
+        expect(result.credit_note).to be_a(CreditNote).and be_new_record
       end
     end
   end

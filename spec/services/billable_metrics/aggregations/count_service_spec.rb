@@ -20,13 +20,14 @@ RSpec.describe BillableMetrics::Aggregations::CountService do
   let(:event_store_class) { Events::Stores::PostgresStore }
   let(:bypass_aggregation) { false }
   let(:filters) do
-    {event: pay_in_advance_event, grouped_by:, matching_filters:, ignored_filters:}
+    {event: pay_in_advance_event, grouped_by:, presentation_by:, matching_filters:, ignored_filters:}
   end
 
   let(:subscription) { create(:subscription, organization:) }
   let(:organization) { create(:organization) }
   let(:customer) { subscription.customer }
   let(:grouped_by) { nil }
+  let(:presentation_by) { nil }
   let(:matching_filters) { {} }
   let(:ignored_filters) { [] }
 
@@ -146,6 +147,118 @@ RSpec.describe BillableMetrics::Aggregations::CountService do
 
       expect(result.pay_in_advance_aggregation).to eq(1)
     end
+
+    context "with presentation group keys" do
+      let(:presentation_by) { ["cloud", "region"] }
+      let(:pay_in_advance_event) do
+        create(
+          :event,
+          organization_id: organization.id,
+          code: billable_metric.code,
+          subscription:,
+          customer:,
+          properties: {"cloud" => "aws", "region" => "eu"}
+        )
+      end
+
+      it "assigns pay_in_advance_breakdowns based on the pay_in_advance event" do
+        result = count_service.aggregate
+
+        expect(result.pay_in_advance_breakdowns).to eq([
+          {groups: {"cloud" => "aws", "region" => "eu"}, value: 1}
+        ])
+      end
+    end
+  end
+
+  context "with presentation group keys" do
+    let(:presentation_by) { ["cloud"] }
+
+    let(:event_list) do
+      create_list(
+        :event,
+        3,
+        organization_id: organization.id,
+        code: billable_metric.code,
+        subscription:,
+        customer:,
+        timestamp: Time.zone.now - 1.day,
+        properties: {"cloud" => "aws"}
+      ) + create_list(
+        :event,
+        1,
+        organization_id: organization.id,
+        code: billable_metric.code,
+        subscription:,
+        customer:,
+        timestamp: Time.zone.now - 1.day,
+        properties: {"cloud" => "gcp"}
+      )
+    end
+
+    it "returns the aggregations per group" do
+      result = count_service.aggregate
+
+      expect(result.breakdowns).to match_array([
+        {groups: {"cloud" => "aws"}, value: 3},
+        {groups: {"cloud" => "gcp"}, value: 1}
+      ])
+    end
+
+    context "with grouped_by" do
+      let(:grouped_by) { ["agent_name"] }
+
+      let(:event_list) do
+        [
+          create(
+            :event,
+            organization_id: organization.id,
+            code: billable_metric.code,
+            subscription:,
+            customer:,
+            timestamp: Time.zone.now - 1.day,
+            properties: {"agent_name" => "frodo", "cloud" => "aws"}
+          ),
+          create(
+            :event,
+            organization_id: organization.id,
+            code: billable_metric.code,
+            subscription:,
+            customer:,
+            timestamp: Time.zone.now - 1.day,
+            properties: {"agent_name" => "frodo", "cloud" => "aws"}
+          ),
+          create(
+            :event,
+            organization_id: organization.id,
+            code: billable_metric.code,
+            subscription:,
+            customer:,
+            timestamp: Time.zone.now - 1.day,
+            properties: {"agent_name" => "frodo", "cloud" => "gcp"}
+          ),
+          create(
+            :event,
+            organization_id: organization.id,
+            code: billable_metric.code,
+            subscription:,
+            customer:,
+            timestamp: Time.zone.now - 1.day,
+            properties: {"agent_name" => "aragorn", "cloud" => "aws"}
+          )
+        ]
+      end
+
+      it "returns the aggregations per group" do
+        result = count_service.aggregate
+
+        expect(result.breakdowns).to match_array([
+          {groups: {"agent_name" => "frodo", "cloud" => "aws"}, value: 2},
+          {groups: {"agent_name" => "frodo", "cloud" => "gcp"}, value: 1},
+          {groups: {"agent_name" => "aragorn", "cloud" => "aws"}, value: 1}
+        ])
+      end
+    end
   end
 
   context "when bypass_aggregation is set to true" do
@@ -185,6 +298,19 @@ RSpec.describe BillableMetrics::Aggregations::CountService do
         result = count_service.per_event_aggregation(include_event_value: true)
 
         expect(result.event_aggregation).to eq([1, 1, 1, 1, 1])
+      end
+    end
+
+    context "when aggregation is bypassed" do
+      let(:bypass_aggregation) { true }
+
+      it "returns an empty aggregation without querying the event store" do
+        allow(Events::Stores::PostgresStore).to receive(:new).and_call_original
+
+        result = count_service.per_event_aggregation
+
+        expect(result.event_aggregation).to eq([])
+        expect(Events::Stores::PostgresStore).not_to have_received(:new)
       end
     end
   end

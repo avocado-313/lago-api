@@ -2,6 +2,10 @@
 
 module Invoices
   class SubscriptionService < BaseService
+    Result = BaseResult[:invoice, :non_invoiceable_fees]
+
+    ACTIVATION_BILLING_REASONS = %i[subscription_starting upgrading].freeze
+
     def initialize(subscriptions:, timestamp:, invoicing_reason:, invoice: nil, skip_charges: false)
       @subscriptions = subscriptions
       @timestamp = timestamp
@@ -21,19 +25,42 @@ module Invoices
     end
 
     def call
+      if activation_billing?
+        with_subscription_locks { perform_call }
+      else
+        perform_call
+      end
+    end
+
+    private
+
+    def perform_call
       return result if active_subscriptions.empty? && recurring
 
+      if mixed_billing_entities?
+        return result.validation_failure!(errors: {billing_entity: ["mixed_billing_entities"]})
+      end
+
+      if mixed_purchase_order_numbers?
+        return result.validation_failure!(errors: {purchase_order_number: ["mixed_purchase_order_numbers"]})
+      end
+
       create_generating_invoice unless invoice
+      invoice.status = :open if subscription_gated?
       result.invoice = invoice
 
-      fee_result = ActiveRecord::Base.transaction do
+      # Activation billing runs inside the lock's transaction, so this needs its own
+      # savepoint to keep rolling partial fees back when it fails.
+      fee_result = ActiveRecord::Base.transaction(requires_new: true) do
         context = grace_period? ? :draft : :finalize
         fee_result = Invoices::CalculateFeesService.call(
           invoice:,
           recurring:,
           context:
         )
-        Invoices::ApplyInvoiceCustomSectionsService.call(invoice:)
+        Invoices::ApplyInvoiceCustomSectionsService.call(invoice:, resources: subscriptions)
+
+        skip_payment_gating_for_zero_amount if subscription_payment_gated? && invoice.total_amount_cents.zero? && !invoice.tax_pending?
 
         set_invoice_generated_status unless invoice.pending?
         invoice.save!
@@ -63,14 +90,18 @@ module Invoices
         if grace_period?
           SendWebhookJob.perform_after_commit("invoice.drafted", invoice)
           Utils::ActivityLog.produce_after_commit(invoice, "invoice.drafted")
+          notify_ready_to_finalize unless invoice.tax_pending?
         end
 
         return result
       end
 
-      if grace_period?
+      if subscription_gated?
+        Invoices::Payments::CreateService.call_async(invoice:)
+      elsif grace_period?
         SendWebhookJob.perform_after_commit("invoice.drafted", invoice)
         Utils::ActivityLog.produce_after_commit(invoice, "invoice.drafted")
+        notify_ready_to_finalize unless invoice.tax_pending?
       else
         unless invoice.closed? # we dont need to send the webhooks if the invoice was closed ( skip 0 invoice setting )
           SendWebhookJob.perform_after_commit("invoice.created", invoice)
@@ -95,13 +126,11 @@ module Invoices
       raise unless invoicing_reason.to_sym == :subscription_periodic
 
       result
-    rescue ActiveRecord::StaleObjectError, Customers::FailedToAcquireLock
+    rescue ActiveRecord::StaleObjectError, BaseLockService::FailedToAcquireLock
       raise
     rescue => e
       result.fail_with_error!(e)
     end
-
-    private
 
     attr_accessor :subscriptions,
       :timestamp,
@@ -112,18 +141,66 @@ module Invoices
       :invoice,
       :skip_charges
 
+    # Cancelling a gated subscription takes the same lock, so holding it here orders the two:
+    # cancellation either finds the gating invoice and closes it, or refuses until it exists.
+    def with_subscription_locks
+      ActiveRecord::Base.transaction do
+        lock_subscriptions!
+        yield
+      end
+    end
+
+    def lock_subscriptions!
+      subscription_ids = subscriptions.map(&:id)
+
+      if subscription_ids.empty?
+        return
+      end
+
+      locked_subscriptions = Subscription
+        .where(id: subscription_ids)
+        .order(:id)
+        .lock
+        .index_by(&:id)
+
+      self.subscriptions = subscriptions.map { |subscription| locked_subscriptions.fetch(subscription.id) }
+    end
+
+    def activation_billing?
+      skip_charges && ACTIVATION_BILLING_REASONS.include?(invoicing_reason.to_sym)
+    end
+
     def active_subscriptions
       @active_subscriptions ||= subscriptions.select(&:active?)
+    end
+
+    def subscription_gated?
+      subscriptions.any?(&:gated?)
+    end
+
+    def subscription_payment_gated?
+      subscriptions.any?(&:payment_gated?)
+    end
+
+    def skip_payment_gating_for_zero_amount
+      gated = subscriptions.find(&:payment_gated?)
+      Subscriptions::ActivationRules::Payment::EvaluateService.call!(
+        rule: gated.activation_rules.payment.sole,
+        status: :satisfied
+      )
+      Subscriptions::ActivationRules::ResolveSubscriptionStatusService.call!(subscription: gated)
     end
 
     def create_generating_invoice
       invoice_result = Invoices::CreateGeneratingService.call(
         customer:,
+        billing_entity: invoice_billing_entity,
         invoice_type: :subscription,
         invoicing_reason:,
         currency:,
         datetime: Time.zone.at(timestamp),
-        skip_charges:
+        skip_charges:,
+        purchase_order_number: subscriptions.first&.purchase_order_number
       ) do |invoice|
         Invoices::CreateInvoiceSubscriptionService
           .call(invoice:, subscriptions:, timestamp:, invoicing_reason:)
@@ -136,7 +213,21 @@ module Invoices
     end
 
     def grace_period?
+      return false if subscription_gated?
+
       @grace_period ||= customer.applicable_invoice_grace_period.positive?
+    end
+
+    def invoice_billing_entity
+      subscriptions.first&.billing_entity || customer.billing_entity
+    end
+
+    def mixed_billing_entities?
+      subscriptions.map(&:applicable_billing_entity_id).uniq.many?
+    end
+
+    def mixed_purchase_order_numbers?
+      subscriptions.map(&:purchase_order_number).uniq.many?
     end
 
     def set_invoice_generated_status
@@ -147,7 +238,7 @@ module Invoices
 
     def should_deliver_finalized_email?
       License.premium? &&
-        customer.billing_entity.email_settings.include?("invoice.finalized")
+        invoice.billing_entity.email_settings.include?("invoice.finalized")
     end
 
     def flag_lifetime_usage_for_refresh
@@ -173,6 +264,11 @@ module Invoices
       after_commit do
         DailyUsages::FillFromInvoiceJob.perform_later(invoice:, subscriptions:)
       end
+    end
+
+    def notify_ready_to_finalize
+      SendWebhookJob.perform_after_commit("invoice.ready_to_finalize", invoice)
+      Utils::ActivityLog.produce_after_commit(invoice, "invoice.ready_to_finalize")
     end
   end
 end

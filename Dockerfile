@@ -1,5 +1,5 @@
-ARG PDFCPU_VERSION=0.11.1
-ARG GO_VERSION=1.25.8
+ARG PDFCPU_VERSION=0.15.0
+ARG GO_VERSION=1.26.6
 
 FROM golang:${GO_VERSION} AS pdfcpu-build
 
@@ -7,7 +7,7 @@ ARG PDFCPU_VERSION
 
 RUN go install github.com/pdfcpu/pdfcpu/cmd/pdfcpu@v${PDFCPU_VERSION}
 
-FROM ruby:4.0.2-slim AS build
+FROM ruby:4.0.6-slim AS build
 
 ARG BUNDLE_WITH
 
@@ -20,9 +20,9 @@ RUN apt install nodejs curl build-essential git pkg-config libpq-dev libclang-de
 COPY ./Gemfile /app/Gemfile
 COPY ./Gemfile.lock /app/Gemfile.lock
 
-ENV BUNDLER_VERSION='4.0.4'
+ENV BUNDLER_VERSION='4.0.19'
 ENV PATH="$PATH:/root/.cargo/bin/"
-RUN gem install bundler --no-document -v '4.0.4'
+RUN gem install bundler --no-document -v '4.0.19'
 
 ENV BUNDLE_WITH=${BUNDLE_WITH:-}
 ENV BUNDLE_WITHOUT="development test"
@@ -30,12 +30,14 @@ RUN --mount=type=secret,id=BUNDLE_GEMS__CONTRIBSYS__COM,env=BUNDLE_GEMS__CONTRIB
   bundle config set build.nokogiri --use-system-libraries &&\
   bundle install --jobs=3 --retry=3
 
-FROM ruby:4.0.2-slim
+FROM ruby:4.0.6-slim
 
 ARG BUNDLE_WITH
 
 RUN apt update && apt upgrade -y
-RUN apt install git libpq-dev curl postgresql-client -y
+RUN apt install git libpq-dev curl postgresql-client libjemalloc2 -y
+
+ENV LD_PRELOAD=libjemalloc.so.2
 
 ARG SEGMENT_WRITE_KEY
 ARG GOCARDLESS_CLIENT_ID

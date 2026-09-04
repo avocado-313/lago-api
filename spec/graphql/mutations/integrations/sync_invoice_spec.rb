@@ -34,7 +34,7 @@ RSpec.describe Mutations::Integrations::SyncInvoice do
   let(:service) { instance_double(Integrations::Aggregator::Invoices::CreateService) }
 
   let(:result) do
-    r = BaseService::Result.new
+    r = Integrations::Aggregator::Invoices::CreateService::Result.new
     r.invoice_id = invoice.id
     r
   end
@@ -51,7 +51,7 @@ RSpec.describe Mutations::Integrations::SyncInvoice do
   it_behaves_like "requires permission", "organization:integrations:update"
 
   it "syncs an invoice" do
-    expect(::Integrations::Aggregator::Invoices::CreateService).to have_received(:new).with(invoice:)
+    expect(::Integrations::Aggregator::Invoices::CreateService).to have_received(:new).with(invoice:, find_first: true)
     expect(service).to have_received(:call_async)
   end
 end

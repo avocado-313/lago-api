@@ -15,6 +15,7 @@ RSpec.describe Types::Organizations::CurrentOrganizationType do
     expect(subject).to have_field(:legal_number).of_type("String")
     expect(subject).to have_field(:logo_url).of_type("String")
     expect(subject).to have_field(:name).of_type("String!")
+    expect(subject).to have_field(:slug).of_type("String!")
     expect(subject).to have_field(:tax_identification_number).of_type("String")
 
     expect(subject).to have_field(:address_line1).of_type("String")
@@ -33,6 +34,8 @@ RSpec.describe Types::Organizations::CurrentOrganizationType do
 
     expect(subject).to have_field(:created_at).of_type("ISO8601DateTime!")
     expect(subject).to have_field(:updated_at).of_type("ISO8601DateTime!")
+
+    expect(subject).to have_field(:events_store).of_type("EventsStoreEnum!")
 
     expect(subject).to have_field(:finalize_zero_amount_invoice).of_type("Boolean!")
     expect(subject).to have_field(:billing_configuration).of_type("OrganizationBillingConfiguration").with_permission("organization:invoices:view")

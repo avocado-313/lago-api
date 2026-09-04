@@ -2,6 +2,8 @@
 
 module Invoices
   class CustomerUsageService < BaseService
+    Result = BaseResult[:invoice, :usage, :fees_taxes]
+
     def initialize(
       customer:,
       subscription:,
@@ -73,11 +75,13 @@ module Invoices
         .plan
         .charges
         .joins(:billable_metric)
-        .includes(:taxes, billable_metric: :organization, filters: {values: :billable_metric_filter})
+        .includes(:taxes, :applied_pricing_unit, billable_metric: :organization, filters: {values: :billable_metric_filter})
       if usage_filters.filter_by_charge_id.present?
         charges = charges.where(id: usage_filters.filter_by_charge_id)
       elsif usage_filters.filter_by_charge_code.present?
         charges = charges.where(code: usage_filters.filter_by_charge_code)
+      elsif usage_filters.filter_by_metric_code.present?
+        charges = charges.where(billable_metrics: {code: usage_filters.filter_by_metric_code})
       end
       @charges = charges
     end
@@ -115,8 +119,8 @@ module Invoices
 
     def compute_charge_fees
       fees = []
-      filters = event_filters(subscription, boundaries).charges
-      charges.find_each { |c| fees += charge_usage(c, filters[c.id] || []) }
+      filters = event_filters(subscription, boundaries).filter_targets
+      charges.find_each { |c| fees += charge_usage(c, filters[c.target_key] || {}) }
       return fees if usage_filters.has_charge_filter?
 
       fees.sort_by { |f| f.billable_metric.name.downcase }
@@ -127,27 +131,29 @@ module Invoices
         subscription:,
         charge:,
         to_datetime: boundaries.charges_to_datetime,
-        cache: cache_applicable?
+        cache: charge_cache_enabled?,
+        full_usage: usage_filters.full_usage,
+        last_seen_at: applied_filters
       )
 
       applied_boundaries = boundaries
       applied_boundaries = boundaries.dup.tap { it.max_timestamp = max_timestamp } if max_timestamp
-      if usage_filters.filter_by_group.present?
-        cache_middleware = nil
-      end
 
       Fees::ChargeService
         .call!(
           invoice:,
-          charge:,
+          metered_item: Fees::ChargeService::MeteredItem.from_charge(charge:, boundaries: applied_boundaries),
           subscription:,
-          boundaries: applied_boundaries,
-          context: :current_usage,
           cache_middleware:,
-          calculate_projected_usage:,
-          with_zero_units_filters:,
-          filtered_aggregations: applied_filters,
-          usage_filters:
+          filtered_aggregations: applied_filters.keys,
+          options: Fees::ChargeService::Options.new(
+            context: :current_usage,
+            calculate_projected_usage:,
+            with_zero_units_filters:,
+            usage_filters:,
+            # NOTE: current usage is computed on a non-persisted invoice, so adjusted fees never apply
+            skip_adjusted_fees: true
+          )
         )
         .fees
     end
@@ -173,17 +179,6 @@ module Invoices
       @date_service ||= Subscriptions::DatesService.new_instance(subscription, timestamp, current_usage: true)
     end
 
-    # NOTE: The charge cache key does not include from_datetime, so when full_usage
-    #       shifts the boundaries back to subscription.started_at, the cache would
-    #       return stale current-period data. Disable cache in that case.
-    #       When started_at matches the current period boundary, the aggregation
-    #       window is identical and the cache is safe to use.
-    def cache_applicable?
-      return with_cache unless usage_filters.full_usage
-
-      with_cache && subscription.started_at == date_service.charges_from_datetime
-    end
-
     def compute_amounts
       invoice.fees_amount_cents = invoice.fees.sum(&:amount_cents)
       plan = subscription.plan
@@ -207,15 +202,31 @@ module Invoices
     end
 
     def compute_amounts_with_provider_taxes
+      # NOTE: Only fees with a positive amount can incur tax, so non-taxable fees are
+      #       excluded from the provider request. This also keeps the payload under the
+      #       provider line-item limit (Anrok/Avalara reject payloads above 1200 items).
+      #       Excluded fees owe no tax and keep their default zero taxes in the usage response.
+      taxable_fees = invoice.fees.select(&:taxable?)
+
+      # NOTE: With no taxable fees the provider request would carry an empty line-item
+      #       array, which Anrok/Avalara reject. There is no tax to compute, so fall back
+      #       to the zero-tax path and skip the provider entirely.
+      return compute_amounts_without_tax if taxable_fees.empty?
+
       invoice.fees_amount_cents = invoice.fees.sum(&:amount_cents)
 
-      taxes_result = Integrations::Aggregator::Taxes::Invoices::CreateDraftService.call(invoice:, fees: invoice.fees)
+      # NOTE: Set the sub total so Invoices::ApplyProviderTaxesService prorates taxes_rate
+      #       by amount (like persisted invoices) instead of falling back to its zero-amount
+      #       count-based branch, which would dilute the rate with the excluded non-taxable fees.
+      invoice.sub_total_excluding_taxes_amount_cents = invoice.fees_amount_cents
+
+      taxes_result = Integrations::Aggregator::Taxes::Invoices::CreateDraftService.call(invoice:, fees: taxable_fees)
 
       return result.validation_failure!(errors: {tax_error: [taxes_result.error.message]}) unless taxes_result.success?
 
       result.fees_taxes = taxes_result.fees
 
-      invoice.fees.each do |fee|
+      taxable_fees.each do |fee|
         fee_taxes = result.fees_taxes.find do |item|
           item.item_key == fee.item_key
         end
@@ -247,10 +258,41 @@ module Invoices
       @customer_provider_taxation ||= invoice.customer.tax_customer
     end
 
+    # Only the charges being computed are billed, so restricting the event lookup to their codes
+    # avoids resolving combinations for the rest of the plan. The ingestion timestamps are requested
+    # only when the charge cache can actually read them.
     def event_filters(subscription, boundaries)
-      Events::BillingPeriodFilterService.call!(
-        subscription:, boundaries:
+      Events::BillingPeriodFilterService.for_charges!(
+        subscription:,
+        boundaries:,
+        codes: filtered_metric_codes,
+        with_last_seen_at: charge_cache_enabled?
       )
+    end
+
+    # nil when every charge of the plan is computed, so the whole plan is looked up as before.
+    def filtered_metric_codes
+      return nil unless usage_filters.has_charge_filter?
+
+      charges.except(:includes).joins(:billable_metric).distinct.pluck("billable_metrics.code")
+    end
+
+    # Single gate for the charge cache: it drives both the middleware passed to Fees::ChargeService
+    # and whether the ingestion timestamps are requested. The two must never diverge, because a nil
+    # timestamp written into a live cache stays valid forever (see Events::BillingPeriodFilterService).
+    # Usage filtered by group is never cached, as its fees are a subset of the charge fees.
+    def charge_cache_enabled?
+      with_cache &&
+        usage_filters.filter_by_group.blank? &&
+        (!usage_filters.full_usage || full_usage_cache_enabled?)
+    end
+
+    # Full usage is cached only with lazy validation, the one invalidation that clears its key.
+    def full_usage_cache_enabled?
+      organization.granular_lifetime_usage_enabled? &&
+        organization.feature_flag_enabled?(:lazy_charge_usage_cache) &&
+        !usage_filters.skip_grouping &&
+        usage_filters.filter_by_presentation.nil?
     end
 
     def querying_full_usage_allowed

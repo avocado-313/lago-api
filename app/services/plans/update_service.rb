@@ -4,11 +4,12 @@ module Plans
   class UpdateService < BaseService
     Result = BaseResult[:plan]
 
-    def initialize(plan:, params:, partial_metadata: false)
+    def initialize(plan:, params:, partial_metadata: false, send_webhook: true)
       @plan = plan
       @params = params
       @timestamp = Time.current.to_i
       @partial_metadata = partial_metadata
+      @send_webhook = send_webhook
       super
     end
 
@@ -20,6 +21,18 @@ module Plans
 
     def call
       return result.not_found_failure!(resource: "plan") unless plan
+
+      if params.key?(:amount_currency) && params[:amount_currency] != plan.amount_currency &&
+          plan.applied_rate_cards.exists?
+        return result.single_validation_failure!(field: :amount_currency, error_code: "not_editable_with_applied_rate_cards")
+      end
+
+      if plan.product_catalog? || plan.organization.product_catalog_enabled?
+        legacy_field = Plans::CreateService::LEGACY_PRICING_FIELDS.find { params.key?(it) }
+        if legacy_field
+          return result.single_validation_failure!(field: legacy_field, error_code: "legacy_billing_disabled")
+        end
+      end
 
       old_amount_cents = plan.amount_cents
 
@@ -75,7 +88,7 @@ module Plans
 
       plan.invoices.draft.update_all(ready_to_be_refreshed: true) # rubocop:disable Rails/SkipsModelValidations
 
-      SendWebhookJob.perform_after_commit("plan.updated", plan)
+      SendWebhookJob.perform_after_commit("plan.updated", plan) if send_webhook
       result.plan = plan.reload
       result
     rescue ActiveRecord::RecordInvalid => e
@@ -86,7 +99,7 @@ module Plans
 
     private
 
-    attr_reader :plan, :params, :timestamp, :partial_metadata
+    attr_reader :plan, :params, :timestamp, :partial_metadata, :send_webhook
 
     delegate :organization, to: :plan
 
@@ -143,15 +156,37 @@ module Plans
       return unless cascade_needed?
 
       old_parent_attrs = charge.attributes
-      old_parent_filters_attrs = charge.filters.map(&:attributes)
       old_parent_applied_pricing_unit_attrs = charge.applied_pricing_unit&.attributes
+      before_filters = capture_filters(charge) if payload_charge.key?(:filters)
 
-      Charges::UpdateChildrenJob.perform_later(
-        params: payload_charge.deep_stringify_keys,
-        old_parent_attrs:,
-        old_parent_filters_attrs:,
-        old_parent_applied_pricing_unit_attrs:
-      )
+      after_commit do
+        Charges::UpdateChildrenJob.perform_later(
+          params: payload_charge.except(:filters).deep_stringify_keys,
+          old_parent_attrs:,
+          old_parent_applied_pricing_unit_attrs:
+        )
+
+        cascade_filter_changes(charge, before_filters) if before_filters
+      end
+    end
+
+    def capture_filters(charge)
+      charge.filters.includes(values: :billable_metric_filter).map do |f|
+        {
+          values: f.to_h.deep_stringify_keys,
+          properties: f.properties,
+          invoice_display_name: f.invoice_display_name,
+          code: f.code
+        }
+      end
+    end
+
+    # Read back rather than reuse the payload: the codes are assigned while saving, and a child
+    # filter has to be created with the code of the parent filter it copies
+    def cascade_filter_changes(charge, before)
+      charge.filters.reset
+
+      ChargeFilters::CascadeDispatcher.call(charge:, before:, after: capture_filters(charge))
     end
 
     def cascade_fixed_charge_removal(fixed_charge)
@@ -268,14 +303,7 @@ module Plans
     end
 
     def trigger_pay_in_advance_billing
-      plan.subscriptions.active.find_each do |subscription|
-        after_commit do
-          Invoices::CreatePayInAdvanceFixedChargesJob.perform_later(
-            subscription,
-            timestamp
-          )
-        end
-      end
+      Invoices::CreateAllPayInAdvanceFixedChargesJob.perform_after_commit(plan, timestamp)
     end
 
     def sanitize_fixed_charges(plan, args_fixed_charges, created_fixed_charges_ids)
@@ -325,10 +353,18 @@ module Plans
         next unless subscription.previous_subscription
 
         if plan.yearly_amount_cents >= subscription.previous_subscription.plan.yearly_amount_cents
+          upgrade_params = {name: subscription.name}
+
+          if subscription.activation_rules.any?
+            upgrade_params[:activation_rules] = subscription.activation_rules.map do |rule|
+              {type: rule.type, timeout_hours: rule.timeout_hours}
+            end
+          end
+
           Subscriptions::PlanUpgradeService.call(
             current_subscription: subscription.previous_subscription,
             plan: plan,
-            params: {name: subscription.name}
+            params: upgrade_params
           ).raise_if_error!
         end
       end

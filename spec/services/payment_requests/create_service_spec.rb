@@ -68,6 +68,21 @@ RSpec.describe PaymentRequests::CreateService, :premium do
       end
     end
 
+    context "when the invoices are deleted" do
+      before do
+        first_invoice.update!(status: :deleted)
+        second_invoice.update!(status: :deleted)
+      end
+
+      it "returns not found failure" do
+        result = create_service.call
+
+        expect(result).not_to be_success
+        expect(result.error).to be_a(BaseService::NotFoundFailure)
+        expect(result.error.resource).to eq("invoice")
+      end
+    end
+
     context "when invoices are not overdue" do
       before { first_invoice.update!(payment_overdue: false) }
 
@@ -89,6 +104,20 @@ RSpec.describe PaymentRequests::CreateService, :premium do
         expect(result).not_to be_success
         expect(result.error).to be_a(BaseService::MethodNotAllowedFailure)
         expect(result.error.code).to eq("invoices_have_different_currencies")
+      end
+    end
+
+    context "when invoices have different billing entities" do
+      let(:other_billing_entity) { create(:billing_entity, organization:) }
+
+      before { second_invoice.update!(billing_entity: other_billing_entity) }
+
+      it "returns not allowed failure" do
+        result = create_service.call
+
+        expect(result).not_to be_success
+        expect(result.error).to be_a(BaseService::MethodNotAllowedFailure)
+        expect(result.error.code).to eq("invoices_have_different_billing_entities")
       end
     end
 

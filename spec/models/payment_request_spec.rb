@@ -27,6 +27,13 @@ RSpec.describe PaymentRequest do
   it { is_expected.to belong_to(:customer) }
   it { is_expected.to belong_to(:dunning_campaign).optional }
 
+  describe "normalizations" do
+    it "sanitizes email on assignment" do
+      payment_request.email = " hello@some\u200Bthing\u2013other.com "
+      expect(payment_request.email).to eq("hello@something-other.com")
+    end
+  end
+
   describe "Validations" do
     it "is valid with valid attributes" do
       expect(payment_request).to be_valid
@@ -70,6 +77,12 @@ RSpec.describe PaymentRequest do
 
     it "returns a list with the applied invoice ids" do
       expect(payment_request.invoice_ids).to eq(invoices.map(&:id))
+    end
+  end
+
+  describe "#subscription_payment_gated?" do
+    it "returns false because a payment request settles finalized invoices" do
+      expect(payment_request.subscription_payment_gated?).to eq(false)
     end
   end
 

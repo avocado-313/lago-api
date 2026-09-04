@@ -8,12 +8,16 @@ RSpec.describe Fee do
   it { is_expected.to belong_to(:add_on).optional }
   it { is_expected.to belong_to(:charge).optional }
   it { is_expected.to belong_to(:fixed_charge).optional }
+  it { is_expected.to belong_to(:rate_card_rate).optional }
+  it { is_expected.to belong_to(:rate_override).optional }
+  it { is_expected.to have_many(:presentation_breakdowns) }
   it { is_expected.to have_one(:fixed_charge_add_on).through(:fixed_charge) }
   it { is_expected.to have_one(:adjusted_fee).dependent(:nullify) }
   it { is_expected.to have_one(:billable_metric).through(:charge) }
   it { is_expected.to have_one(:customer).through(:subscription) }
   it { is_expected.to have_one(:pricing_unit_usage).dependent(:destroy) }
   it { is_expected.to have_one(:true_up_fee).with_foreign_key(:true_up_parent_fee_id).class_name("Fee").dependent(:destroy) }
+  it { is_expected.to belong_to(:original_fee).class_name("Fee").optional }
 
   describe "#ordered_by_period" do
     let(:fee1) do
@@ -596,6 +600,135 @@ RSpec.describe Fee do
     end
   end
 
+  describe "#grouped_by_display" do
+    let(:charge) { create(:standard_charge, properties:) }
+    let(:fee) { described_class.new(charge:, fee_type: "charge", grouped_by:) }
+    let(:grouped_by) do
+      {
+        "key_1" => "mercredi",
+        "key_2" => "week_01",
+        "key_3" => "2024"
+      }
+    end
+    let(:properties) do
+      {
+        "amount" => "5",
+        "grouped_by" => %w[key_1 key_2 key_3]
+      }
+    end
+
+    context "when a standard charge fee has grouped_by values" do
+      it "formats the grouped_by values with bullet points" do
+        expect(fee.grouped_by_display).to eq(" • mercredi • week_01 • 2024")
+      end
+    end
+
+    context "when the charge properties are missing the grouped_by property" do
+      let(:properties) do
+        {
+          "amount" => "5"
+        }
+      end
+
+      it "formats the grouped_by values with bullet points" do
+        expect(fee.grouped_by_display).to eq(" • mercredi • week_01 • 2024")
+      end
+    end
+
+    context "when some grouped_by values are nil" do
+      let(:grouped_by) do
+        {
+          "key_1" => nil,
+          "key_2" => "week_01",
+          "key_3" => "2024"
+        }
+      end
+
+      it "skips nil values and formats only the present values" do
+        expect(fee.grouped_by_display).to eq(" • week_01 • 2024")
+      end
+    end
+
+    context "when grouped_by values are all blank" do
+      let(:grouped_by) { {"key_1" => nil} }
+
+      it "returns an empty string" do
+        expect(fee.grouped_by_display).to eq("")
+      end
+    end
+
+    context "when the fee is not a charge" do
+      let(:fee) { described_class.new(fee_type: "subscription", grouped_by:) }
+
+      it "returns an empty string" do
+        expect(fee.grouped_by_display).to eq("")
+      end
+    end
+  end
+
+  describe "#non_zero?" do
+    subject { fee.non_zero? }
+
+    let(:fee) { build(:fee, units:, amount_cents:, events_count:) }
+    let(:units) { 0 }
+    let(:amount_cents) { 0 }
+    let(:events_count) { 0 }
+
+    context "when units, amount_cents and events_count are all zero" do
+      it { is_expected.to be false }
+    end
+
+    context "when only units are positive" do
+      let(:units) { 5 }
+
+      it { is_expected.to be true }
+    end
+
+    context "when only amount_cents are positive" do
+      let(:amount_cents) { 100 }
+
+      it { is_expected.to be true }
+    end
+
+    context "when only events_count is positive" do
+      let(:events_count) { 3 }
+
+      it { is_expected.to be true }
+    end
+
+    context "when events_count is nil" do
+      let(:events_count) { nil }
+
+      it { is_expected.to be false }
+    end
+  end
+
+  describe "#taxable?" do
+    subject { fee.taxable? }
+
+    let(:fee) { build(:fee, units:, amount_cents:, events_count:) }
+    let(:units) { 0 }
+    let(:amount_cents) { 0 }
+    let(:events_count) { 0 }
+
+    context "when amount_cents is positive" do
+      let(:amount_cents) { 100 }
+
+      it { is_expected.to be true }
+    end
+
+    context "when amount_cents is zero" do
+      it { is_expected.to be false }
+    end
+
+    context "when amount_cents is zero but units and events_count are positive" do
+      let(:units) { 5 }
+      let(:events_count) { 3 }
+
+      it { is_expected.to be false }
+    end
+  end
+
   describe "#has_charge_filter?" do
     subject(:fee) { create(:add_on_fee) }
 
@@ -826,6 +959,40 @@ RSpec.describe Fee do
         create(:credit_note_item, fee:, amount_cents: 150)
         expect(subject).to eq(650) # 1000 - 200 - 150
       end
+    end
+  end
+
+  describe "#grouped_or_filtered?" do
+    it "returns false when grouped_by is blank and charge_filter_id is nil" do
+      fee = build(:charge_fee, grouped_by: {}, charge_filter_id: nil)
+      expect(fee).not_to be_grouped_or_filtered
+    end
+
+    it "returns true when grouped_by is present" do
+      fee = build(:charge_fee, grouped_by: {"cloud" => "aws"})
+      expect(fee).to be_grouped_or_filtered
+    end
+
+    it "returns true when charge_filter_id is present" do
+      fee = build(:charge_fee, grouped_by: {}, charge_filter_id: SecureRandom.uuid)
+      expect(fee).to be_grouped_or_filtered
+    end
+  end
+
+  describe "#ungrouped_or_filtered?" do
+    it "returns false when grouped_by is present and charge_filter_id is nil" do
+      fee = build(:charge_fee, grouped_by: {"cloud" => "aws"}, charge_filter_id: nil)
+      expect(fee).not_to be_ungrouped_or_filtered
+    end
+
+    it "returns true when grouped_by is blank" do
+      fee = build(:charge_fee, grouped_by: {}, charge_filter_id: nil)
+      expect(fee).to be_ungrouped_or_filtered
+    end
+
+    it "returns true when charge_filter_id is present" do
+      fee = build(:charge_fee, grouped_by: {"cloud" => "aws"}, charge_filter_id: SecureRandom.uuid)
+      expect(fee).to be_ungrouped_or_filtered
     end
   end
 

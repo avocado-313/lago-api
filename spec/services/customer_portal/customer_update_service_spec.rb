@@ -64,6 +64,19 @@ RSpec.describe CustomerPortal::CustomerUpdateService do
     expect(updated_customer.shipping_country).to eq(shipping_address[:country].upcase)
   end
 
+  it "refreshes the invoices search terms when a searchable field changes" do
+    expect { result }
+      .to have_enqueued_job_after_commit(Customers::RefreshInvoicesSearchTermsJob).with(customer.id)
+  end
+
+  context "when no searchable field changes" do
+    let(:update_args) { {city: "Updated customer city"} }
+
+    it "does not refresh the invoices search terms" do
+      expect { result }.not_to have_enqueued_job(Customers::RefreshInvoicesSearchTermsJob)
+    end
+  end
+
   context "when partialy updating" do
     let(:update_args) do
       {
@@ -80,6 +93,18 @@ RSpec.describe CustomerPortal::CustomerUpdateService do
       expect(result).to be_success
       expect(result.customer.name).to eq(update_args[:name])
       expect(result.customer.shipping_address_line1).to eq(update_args[:shipping_address][:address_line1])
+    end
+  end
+
+  context "with email containing unicode lookalike characters" do
+    let(:update_args) do
+      {
+        email: "hello@something\u2013other.com"
+      }
+    end
+
+    it "sanitizes the email before saving" do
+      expect(result.customer.email).to eq("hello@something-other.com")
     end
   end
 
@@ -115,7 +140,7 @@ RSpec.describe CustomerPortal::CustomerUpdateService do
 
     context "when applying taxes fails" do
       let(:apply_taxes_result) do
-        BaseService::Result.new.not_found_failure!(resource: "tax")
+        Customers::ApplyTaxesService::Result.new.not_found_failure!(resource: "tax")
       end
 
       before do

@@ -47,7 +47,6 @@ RSpec.describe CreditNotes::Refunds::StripeService do
             currency: "chf"
           )
         )
-      allow(SegmentTrackJob).to receive(:perform_later)
     end
 
     it "creates a stripe refund and a refund" do
@@ -58,6 +57,8 @@ RSpec.describe CreditNotes::Refunds::StripeService do
       expect(result.refund.id).to be_present
 
       expect(result.refund.credit_note).to eq(credit_note)
+      expect(result.refund.refundable).to eq(credit_note)
+      expect(result.refund.reason).to eq("credit_note")
       expect(result.refund.payment).to eq(payment)
       expect(result.refund.payment_provider).to eq(stripe_payment_provider)
       expect(result.refund.payment_provider_customer).to eq(stripe_customer)
@@ -73,7 +74,7 @@ RSpec.describe CreditNotes::Refunds::StripeService do
     it "call SegmentTrackJob" do
       stripe_service.create
 
-      expect(SegmentTrackJob).to have_received(:perform_later).with(
+      expect(SegmentTrackJob).to have_been_enqueued.with(
         membership_id: CurrentContext.membership,
         event: "refund_status_changed",
         properties: {
@@ -119,6 +120,23 @@ RSpec.describe CreditNotes::Refunds::StripeService do
 
         expect(result.credit_note).to be_succeeded
         expect(result.credit_note.refunded_at).to be_present
+      end
+    end
+
+    context "when the provider was disconnected and reconnected" do
+      let(:reconnected_provider) { create(:stripe_provider, organization:, code: "stripe_reconnected") }
+      let(:reconnected_customer) { create(:stripe_customer, customer:, payment_provider: reconnected_provider) }
+
+      before do
+        stripe_customer.discard!
+        reconnected_customer
+      end
+
+      it "attaches the refund to the provider customer that holds the payment" do
+        result = stripe_service.create
+
+        expect(result).to be_success
+        expect(result.refund.payment_provider_customer_id).to eq(stripe_customer.id)
       end
     end
 
@@ -279,14 +297,12 @@ RSpec.describe CreditNotes::Refunds::StripeService do
     end
 
     it "calls SegmentTrackJob" do
-      allow(SegmentTrackJob).to receive(:perform_later)
-
       stripe_service.update_status(
         provider_refund_id: refund.provider_refund_id,
         status: "succeeded"
       )
 
-      expect(SegmentTrackJob).to have_received(:perform_later).with(
+      expect(SegmentTrackJob).to have_been_enqueued.with(
         membership_id: CurrentContext.membership,
         event: "refund_status_changed",
         properties: {
@@ -356,7 +372,7 @@ RSpec.describe CreditNotes::Refunds::StripeService do
 
     context "when status is failed" do
       before do
-        stripe_customer
+        payment
       end
 
       it "delivers an error webhook" do

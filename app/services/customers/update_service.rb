@@ -5,6 +5,8 @@ module Customers
     extend Forwardable
     include Customers::PaymentProviderFinder
 
+    Result = BaseResult[:customer]
+
     def initialize(customer:, args:)
       @customer = customer
       @args = args
@@ -30,6 +32,7 @@ module Customers
       old_payment_provider = customer.payment_provider
       old_provider_customer = customer.provider_customer
       original_tax_values = customer.slice(:tax_identification_number, :zipcode, :country).symbolize_keys
+      original_searchable_values = customer.slice(*Customer::SEARCHABLE_CUSTOMER_FIELDS)
       ActiveRecord::Base.transaction do
         billing_configuration = args[:billing_configuration]&.to_h || {}
         shipping_address = args[:shipping_address]&.to_h || {}
@@ -94,12 +97,15 @@ module Customers
       end
 
       # NOTE: Some fields are not editable if customer is attached to subscriptions:
-      #       external_id,
-      #       account_type,
-      #       billing_entity_id
+      #       external_id, account_type
+      billing_entity_changed = false
+      if args.key?(:billing_entity_code)
+        customer.billing_entity = billing_entity
+        billing_entity_changed = customer.billing_entity_id_changed?
+      end
+
       if customer.editable?
         customer.external_id = args[:external_id] if args.key?(:external_id)
-        customer.billing_entity = billing_entity if args.key?(:billing_entity_code)
 
         if organization.revenue_share_enabled?
           customer.account_type = args[:account_type] if args.key?(:account_type)
@@ -126,9 +132,12 @@ module Customers
       end
 
       ActiveRecord::Base.transaction do
-        if old_provider_customer && args[:payment_provider].nil? && args[:payment_provider_code].present?
+        if old_provider_customer && payment_provider_removed?
           old_provider_customer.discard!
           customer.payment_provider_code = nil
+          old_provider_customer.payment_methods.find_each do |payment_method|
+            PaymentMethods::DestroyService.call(payment_method:)
+          end
         end
 
         if customer.applied_dunning_campaign_id_changed? || customer.exclude_from_dunning_campaign_changed?
@@ -145,15 +154,29 @@ module Customers
         customer.error_details.tax_error.delete_all if @address_changed
         customer.reload
 
+        if customer.slice(*Customer::SEARCHABLE_CUSTOMER_FIELDS) != original_searchable_values
+          Customers::RefreshInvoicesSearchTermsJob.perform_after_commit(customer.id)
+        end
+
+        tax_attributes_changed = original_tax_values.any? { |key, value| args.key?(key) && args[key] != value }
+
         eu_tax_code_result = Customers::EuAutoTaxesService.call(
           customer:,
           new_record: false,
-          tax_attributes_changed: original_tax_values.any? { |key, value| args.key?(key) && args[key] != value }
+          tax_attributes_changed: tax_attributes_changed || billing_entity_changed
         )
 
         if eu_tax_code_result.success?
           args[:tax_codes] ||= []
           args[:tax_codes] = (args[:tax_codes] + [eu_tax_code_result.tax_code]).uniq
+        end
+
+        # NOTE: EU-managed taxes (lago_eu_*) belong to the previous billing entity. When the
+        #       billing entity changes and no new EU tax applies (new entity does not manage
+        #       EU taxes, or a VIES check is still pending), reset them so the customer falls
+        #       back to the new billing entity's taxes.
+        if billing_entity_changed && args[:tax_codes].nil?
+          args[:tax_codes] = customer.taxes.where.not("code ILIKE ?", "lago_eu%").pluck(:code)
         end
 
         if args[:tax_codes]
@@ -175,12 +198,6 @@ module Customers
       end
 
       result.customer = customer
-
-      if old_provider_customer && args.key?(:payment_provider) && args[:payment_provider].nil?
-        old_provider_customer.payment_methods.find_each do |payment_method|
-          PaymentMethods::DestroyService.call(payment_method:)
-        end
-      end
 
       IntegrationCustomers::CreateOrUpdateBatchService.call(
         integration_customers: args[:integration_customers],
@@ -204,6 +221,10 @@ module Customers
 
     def billing_entity
       @billing_entity ||= organization.billing_entities.find_by!(code: args[:billing_entity_code])
+    end
+
+    def payment_provider_removed?
+      args.key?(:payment_provider) && args[:payment_provider].nil?
     end
 
     def valid_metadata_count?(metadata:)

@@ -13,15 +13,23 @@ class SendWebhookJob < ApplicationJob
 
   retry_on ActiveJob::DeserializationError, wait: :polynomially_longer, attempts: 6
 
+  # Retry when S3 throttles queries.
+  retry_on "Aws::S3::Errors::SlowDown", wait: :polynomially_longer, attempts: 6
+
   WEBHOOK_SERVICES = {
     "alert.triggered" => Webhooks::UsageMonitoring::AlertTriggeredService,
+    "billable_metric.created" => Webhooks::BillableMetrics::CreatedService,
+    "billable_metric.updated" => Webhooks::BillableMetrics::UpdatedService,
+    "billable_metric.deleted" => Webhooks::BillableMetrics::DeletedService,
     "dunning_campaign.finished" => Webhooks::DunningCampaigns::FinishedService,
     "invoice.created" => Webhooks::Invoices::CreatedService,
     "invoice.one_off_created" => Webhooks::Invoices::OneOffCreatedService,
     "invoice.paid_credit_added" => Webhooks::Invoices::PaidCreditAddedService,
     "invoice.generated" => Webhooks::Invoices::GeneratedService,
     "invoice.drafted" => Webhooks::Invoices::DraftedService,
+    "invoice.ready_to_finalize" => Webhooks::Invoices::ReadyToFinalizeService,
     "invoice.voided" => Webhooks::Invoices::VoidedService,
+    "invoice.deleted" => Webhooks::Invoices::DeletedService,
     "invoice.payment_dispute_lost" => Webhooks::Invoices::PaymentDisputeLostService,
     "invoice.payment_status_updated" => Webhooks::Invoices::PaymentStatusUpdatedService,
     "invoice.payment_overdue" => Webhooks::Invoices::PaymentOverdueService,
@@ -46,6 +54,12 @@ class SendWebhookJob < ApplicationJob
     "credit_note.generated" => Webhooks::CreditNotes::GeneratedService,
     "credit_note.provider_refund_failure" => Webhooks::CreditNotes::PaymentProviderRefundFailureService,
     "integration.provider_error" => Webhooks::Integrations::ProviderErrorService,
+    "order.created" => Webhooks::Orders::CreatedService,
+    "order.executed" => Webhooks::Orders::ExecutedService,
+    "order_form.created" => Webhooks::OrderForms::CreatedService,
+    "order_form.signed" => Webhooks::OrderForms::SignedService,
+    "order_form.expired" => Webhooks::OrderForms::ExpiredService,
+    "order_form.voided" => Webhooks::OrderForms::VoidedService,
     "payment.requires_action" => Webhooks::Payments::RequiresActionService,
     "payment.succeeded" => Webhooks::Payments::SucceededService,
     "payment_provider.error" => Webhooks::PaymentProviders::ErrorService,
@@ -60,6 +74,9 @@ class SendWebhookJob < ApplicationJob
     "feature.created" => Webhooks::Features::CreatedService,
     "feature.updated" => Webhooks::Features::UpdatedService,
     "feature.deleted" => Webhooks::Features::DeletedService,
+    "quote.created" => Webhooks::Quotes::CreatedService,
+    "quote.approved" => Webhooks::Quotes::ApprovedService,
+    "quote.voided" => Webhooks::Quotes::VoidedService,
     "subscription.canceled" => Webhooks::Subscriptions::CanceledService,
     "subscription.incomplete" => Webhooks::Subscriptions::IncompleteService,
     "subscription.terminated" => Webhooks::Subscriptions::TerminatedService,

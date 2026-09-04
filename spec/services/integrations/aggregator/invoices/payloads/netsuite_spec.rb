@@ -147,9 +147,9 @@ RSpec.describe Integrations::Aggregator::Invoices::Payloads::Netsuite do
     end
 
     let(:invoice_link) do
-      url = ENV["LAGO_FRONT_URL"].presence || "https://app.getlago.com"
+      url = Rails.application.config.lago_front_url
 
-      URI.join(url, "/customer/#{customer.id}/", "invoice/#{invoice.id}/overview").to_s
+      URI.join(url, "/#{customer.organization.slug}/customer/#{customer.id}/", "invoice/#{invoice.id}/overview").to_s
     end
 
     let(:due_date) { invoice.payment_due_date.strftime("%-m/%-d/%Y") }

@@ -7,6 +7,16 @@ module Customers
 
     queue_as :default
 
+    # until_and_while_executing takes the enqueue lock (keyed on the customer) so
+    # duplicate enqueues while one is pending are deduped, then releases it before
+    # perform runs and holds a separate runtime lock during execution. Releasing the
+    # enqueue lock before perform is what lets schedule_retry re-enqueue this job for
+    # the same customer from inside perform without being dropped.
+    # The retry is scheduled with a delay (RETRY_DELAYS starts at 5 minutes), so by
+    # the time it runs the current job has finished and released the runtime lock,
+    # and the retry is not dropped by the runtime guard either.
+    unique :until_and_while_executing, on_conflict: :log
+
     def perform(customer)
       vies_check_result = Customers::ViesCheckService.call(customer:)
 
@@ -32,9 +42,16 @@ module Customers
     end
 
     def enqueue_pending_invoice_finalization(customer)
-      customer.invoices.pending.where(tax_status: "pending").find_each do |invoice|
-        Invoices::FinalizePendingViesInvoiceJob.perform_later(invoice)
-      end
+      # status :open + tax_status :pending only occurs for gated invoices —
+      # EnsureCompletedViesCheckService keeps gated VIES-blocked invoices :open
+      # instead of transitioning them to :pending — so adding :open to the
+      # status set is enough to pick up gated cases without an explicit
+      # subscription_gated? check.
+      customer.invoices
+        .where(status: %i[pending open], tax_status: :pending)
+        .find_each do |invoice|
+          Invoices::FinalizePendingViesInvoiceJob.perform_later(invoice)
+        end
     end
 
     def retry_delay(pending_vies_check)

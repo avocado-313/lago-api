@@ -6,6 +6,7 @@ class Organization < ApplicationRecord
   include Currencies
   include Organizations::AuthenticationMethods
   include HasFeatureFlags
+  include Organizations::Sluggable
 
   self.ignored_columns += [:clickhouse_aggregation]
 
@@ -46,9 +47,15 @@ class Organization < ApplicationRecord
   has_many :charges
   has_many :fixed_charges
   has_many :charge_filters
+  has_many :product_categories
+  has_many :products
+  has_many :product_filters
+  has_many :rate_cards
+  has_many :rate_card_rates
   has_many :pricing_units
   has_many :customers
   has_many :subscriptions
+  has_many :contracts
   has_many :activation_rules, class_name: "Subscription::ActivationRule"
   has_many :invoices
   has_many :credit_notes
@@ -74,6 +81,10 @@ class Organization < ApplicationRecord
   has_many :error_details
   has_many :dunning_campaigns
   has_many :roles
+  has_many :quotes
+  has_many :quote_versions
+  has_many :order_forms
+  has_many :orders
   has_many :activity_logs, class_name: "Clickhouse::ActivityLog"
   has_many :features, class_name: "Entitlement::Feature"
   has_many :privileges, class_name: "Entitlement::Privilege"
@@ -83,7 +94,7 @@ class Organization < ApplicationRecord
 
   has_many :subscription_activities, class_name: "UsageMonitoring::SubscriptionActivity"
   has_many :alerts, class_name: "UsageMonitoring::Alert"
-  has_many :triggered_alerts, class_name: "UsageMonitoring::TriggeredAlert"
+  has_many :triggered_alerts, -> { triggered }, class_name: "UsageMonitoring::TriggeredAlert"
   has_many :pending_vies_checks
 
   has_many :stripe_payment_providers, class_name: "PaymentProviders::StripeProvider"
@@ -106,6 +117,11 @@ class Organization < ApplicationRecord
 
   has_one_attached :logo
 
+  EVENTS_STORES = {
+    clickhouse: "clickhouse",
+    postgres: "postgres"
+  }.freeze
+
   DOCUMENT_NUMBERINGS = [
     :per_customer,
     :per_organization
@@ -119,6 +135,7 @@ class Organization < ApplicationRecord
     beta_payment_authorization
     netsuite
     okta
+    entra_id
     avalara
     xero
     progressive_billing
@@ -143,6 +160,8 @@ class Organization < ApplicationRecord
     events_targeting_wallets
     security_logs
     granular_lifetime_usage
+    order_forms
+    revenue_recognition
   ].freeze
 
   SECURITY_LOGS_RETENTION_DAYS = 90
@@ -172,6 +191,8 @@ class Organization < ApplicationRecord
   validate :validate_premium_integrations
   validate :validate_email_settings
 
+  normalizes :email, with: ->(email) { EmailSanitizer.call(email) }
+
   before_create :set_hmac_key
   after_create :generate_document_number_prefix
 
@@ -183,6 +204,12 @@ class Organization < ApplicationRecord
     define_method("#{premium_integration}_enabled?") do
       License.premium? && premium_integrations.include?(premium_integration)
     end
+  end
+
+  # Product catalog (billing v2) is a rollout feature flag, not a license-gated
+  # premium integration: it is available to any organization, premium or not.
+  def product_catalog_enabled?
+    feature_flag_enabled?(:product_catalog)
   end
 
   def using_lifetime_usage?
@@ -255,6 +282,10 @@ class Organization < ApplicationRecord
 
   def postgres_events_store?
     !clickhouse_events_store?
+  end
+
+  def events_store
+    clickhouse_events_store? ? EVENTS_STORES[:clickhouse] : EVENTS_STORES[:postgres]
   end
 
   # This is added to have a common interface for all organization-related models to access the organization.
@@ -337,6 +368,7 @@ end
 #  net_payment_term                 :integer          default(0), not null
 #  pre_filter_events                :boolean          default(FALSE), not null
 #  premium_integrations             :string           default([]), not null, is an Array
+#  slug                             :string           not null
 #  state                            :string
 #  tax_identification_number        :string
 #  timezone                         :string           default("UTC"), not null
@@ -350,4 +382,5 @@ end
 #
 #  index_organizations_on_api_key   (api_key) UNIQUE
 #  index_organizations_on_hmac_key  (hmac_key) UNIQUE
+#  index_organizations_on_slug      (slug) UNIQUE
 #

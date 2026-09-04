@@ -3,6 +3,8 @@
 module CreditNotes
   module Refunds
     class StripeService < BaseService
+      Result = BaseResult[:credit_note, :refund]
+
       include Customers::PaymentProviderFinder
 
       INVALID_PAYMENT_METHOD_ERROR = "charge_not_refundable"
@@ -22,9 +24,11 @@ module CreditNotes
         refund = Refund.new(
           organization_id: credit_note.organization_id,
           credit_note:,
+          refundable: credit_note,
+          reason: :credit_note,
           payment:,
           payment_provider: payment.payment_provider,
-          payment_provider_customer: payment_provider_customer(customer),
+          payment_provider_customer: payment_provider_customer(payment),
           amount_cents: stripe_result.amount,
           amount_currency: stripe_result.currency&.upcase,
           status: stripe_result.status,
@@ -143,7 +147,7 @@ module CreditNotes
         SendWebhookJob.perform_later(
           "credit_note.provider_refund_failure",
           credit_note,
-          provider_customer_id: payment_provider_customer(customer)&.provider_customer_id,
+          provider_customer_id: payment_provider_customer(payment)&.provider_customer_id,
           provider_error: {
             message:,
             error_code: code

@@ -2,6 +2,8 @@
 
 module Credits
   class AppliedCouponService < BaseService
+    Result = BaseResult[:credit]
+
     def initialize(invoice:, applied_coupon:)
       @invoice = invoice
       @applied_coupon = applied_coupon
@@ -10,7 +12,7 @@ module Credits
     end
 
     def call
-      if !AppliedCoupons::LockService.new(customer:).locked?
+      if !Customers::LockService.new(customer:, scope: :coupon).locked?
         return result.service_failure!(code: "no_lock_acquired", message: "Calling this service without acquiring a lock is not allowed")
       end
 
@@ -39,7 +41,8 @@ module Credits
         fee.save!
       end
 
-      applied_coupon.frequency_duration_remaining -= 1 if applied_coupon.recurring?
+      decrement_frequency_duration_remaining if applied_coupon.recurring?
+
       if should_terminate_applied_coupon?(credit_amount)
         applied_coupon.mark_as_terminated!
       elsif applied_coupon.recurring?
@@ -80,6 +83,10 @@ module Credits
       else
         applied_coupon.frequency_duration_remaining <= 0
       end
+    end
+
+    def decrement_frequency_duration_remaining
+      applied_coupon.frequency_duration_remaining = [applied_coupon.frequency_duration_remaining.to_i - 1, 0].max
     end
 
     # TODO: ensure targeted amount is right with BM/plan limitation

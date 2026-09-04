@@ -5,6 +5,7 @@ module Types
     class Object < Types::BaseObject
       graphql_name "Subscription"
 
+      field :billing_entity_id, ID, null: true
       field :customer, Types::Customers::Object, null: false
       field :external_id, String, null: false
       field :id, ID, null: false
@@ -32,11 +33,14 @@ module Types
       field :created_at, GraphQL::Types::ISO8601DateTime, null: false
       field :updated_at, GraphQL::Types::ISO8601DateTime, null: false
 
+      field :downgrade_plan_date, GraphQL::Types::ISO8601Date
       field :next_name, String, null: true
       field :next_plan, Types::Plans::Object
       field :next_subscription, Types::Subscriptions::Object
       field :next_subscription_at, GraphQL::Types::ISO8601DateTime
       field :next_subscription_type, Types::Subscriptions::NextSubscriptionTypeEnum
+      field :previous_plan, Types::Plans::Object
+      field :previous_subscription, Types::Subscriptions::Object
 
       field :activity_logs, [Types::ActivityLogs::Object], null: true
       field :charges, [Types::Charges::Object], null: true
@@ -47,16 +51,22 @@ module Types
 
       field :usage_thresholds, [Types::UsageThresholds::Object], null: false
 
+      field :consolidate_invoice, Boolean, null: false
       field :payment_method, Types::PaymentMethods::Object
       field :payment_method_type, Types::PaymentMethods::MethodTypeEnum
       field :progressive_billing_disabled, Boolean
+      field :purchase_order_number, String, null: true
 
       field :activated_at, GraphQL::Types::ISO8601DateTime, null: true
       field :activation_rules, [Types::Subscriptions::ActivationRuleType], null: false
-      field :cancelation_reason, Types::Subscriptions::CancelationReasonEnum, null: true
+      field :cancellation_reason, Types::Subscriptions::CancellationReasonEnum, null: true
 
       def next_plan
         object.next_subscription&.plan
+      end
+
+      def previous_plan
+        object.previous_subscription&.plan
       end
 
       def next_name
@@ -76,7 +86,9 @@ module Types
       end
 
       def period_end_date
-        ::Subscriptions::DatesService.new_instance(object, Time.current)
+        return if object.plan.product_catalog?
+
+        ::Subscriptions::DatesService.new_instance(object, object.billing_reference_time)
           .next_end_of_period
       end
 
@@ -87,11 +99,11 @@ module Types
       end
 
       def current_billing_period_started_at
-        dates_service.charges_from_datetime
+        dates_service&.charges_from_datetime
       end
 
       def current_billing_period_ending_at
-        dates_service.charges_to_datetime
+        dates_service&.charges_to_datetime
       end
 
       def charges
@@ -101,13 +113,26 @@ module Types
       end
 
       def fixed_charges
-        object.plan.fixed_charges
+        fcs = object.plan.fixed_charges
           .includes(:add_on, :taxes)
           .order(created_at: :asc)
+
+        effective_units_by_id = ::Subscription::FixedChargeUnitsOverride.units_map_for(
+          subscription: object,
+          fixed_charges: fcs
+        )
+
+        fcs.map do |fc|
+          ::Subscription::FixedChargePresenter.new(fc, object, effective_units: effective_units_by_id[fc.id])
+        end
       end
 
+      # Billing periods derive from the plan interval, which product-catalog
+      # plans don't have: their rate cards each carry their own billing cycle.
       def dates_service
-        @dates_service ||= ::Subscriptions::DatesService.new_instance(object, Time.current, current_usage: true)
+        return if object.plan.product_catalog?
+
+        @dates_service ||= ::Subscriptions::DatesService.new_instance(object, object.billing_reference_time, current_usage: true)
       end
     end
   end

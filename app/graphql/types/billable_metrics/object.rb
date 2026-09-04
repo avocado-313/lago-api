@@ -25,7 +25,7 @@ module Types
 
       field :has_active_subscriptions, Boolean, null: false
       field :has_draft_invoices, Boolean, null: false
-      field :has_plans, Boolean, null: false
+      field :has_plans, Boolean, null: false, method: :attached_to_plan?
       field :has_subscriptions, Boolean, null: false
 
       field :rounding_function, Types::BillableMetrics::RoundingFunctionEnum, null: true
@@ -42,19 +42,15 @@ module Types
       end
 
       def has_active_subscriptions
-        object.subscriptions.active.exists?
+        object.attached_subscriptions.active.exists?
       end
 
       def has_subscriptions
-        object.subscriptions.exists?
+        object.attached_subscriptions.exists?
       end
 
       def has_draft_invoices
-        object.invoices.draft.exists?
-      end
-
-      def has_plans
-        object.plans.exists?
+        object.invoices.draft.where(organization_id: object.organization_id).exists?
       end
 
       def integration_mappings(integration_id: nil)

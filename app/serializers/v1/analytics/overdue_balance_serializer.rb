@@ -6,9 +6,10 @@ module V1
       def serialize
         {
           month: model["month"],
-          amount_cents: model["amount_cents"],
+          amount_cents: model["amount_cents"]&.to_i,
           currency: model["currency"],
-          lago_invoice_ids: JSON.parse(model["lago_invoice_ids"]).flatten
+          lago_invoice_ids: JSON.parse(model["lago_invoice_ids"]).flatten,
+          billing_entity_id: model["billing_entity_id"]
         }
       end
     end

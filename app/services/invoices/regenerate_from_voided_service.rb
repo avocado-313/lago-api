@@ -4,9 +4,10 @@ module Invoices
   class RegenerateFromVoidedService < BaseService
     Result = BaseResult[:invoice]
 
-    def initialize(voided_invoice:, fees_params:)
+    def initialize(voided_invoice:, fees_params:, purchase_order_number: :inherit)
       @voided_invoice = voided_invoice
       @fees_params = fees_params
+      @purchase_order_number = purchase_order_number
       @regenerated_invoice = nil
       super
     end
@@ -21,16 +22,20 @@ module Invoices
 
       ActiveRecord::Base.transaction do
         create_regenerated_invoice
-        create_invoice_subscriptions if regenerated_invoice.invoice_type == "subscription"
+        create_invoice_subscriptions
         process_fees
         adjust_fees
+        assign_applied_usage_thresholds
         Invoices::ApplyInvoiceCustomSectionsService.call!(invoice: regenerated_invoice)
         regenerated_invoice.fees_amount_cents = regenerated_invoice.fees.sum(:amount_cents)
         regenerated_invoice.sub_total_excluding_taxes_amount_cents = regenerated_invoice.fees.sum(:amount_cents)
 
         # apply taxes credits and coupons
         Credits::ProgressiveBillingService.call!(invoice: regenerated_invoice)
-        Credits::AppliedCouponsService.call!(invoice: regenerated_invoice) if should_create_coupon_credit?
+        if should_create_coupon_credit?
+          Credits::AppliedCouponsService.call!(invoice: regenerated_invoice)
+          regenerated_invoice.fees.reload
+        end
         totals_result = Invoices::ComputeTaxesAndTotalsService.call(invoice: regenerated_invoice, finalizing: true)
 
         # We intentionally return early from the transaction block if tax computation fails this is an async call,
@@ -44,6 +49,8 @@ module Invoices
         create_credit_note_credit if should_create_credit_note_credit?
         create_applied_prepaid_credit if should_create_applied_prepaid_credit?
         regenerated_invoice.payment_status = regenerated_invoice.total_amount_cents.positive? ? :pending : :succeeded
+        regenerated_invoice.issuing_date = issuing_date
+        regenerated_invoice.payment_due_date = payment_due_date
         Invoices::TransitionToFinalStatusService.call!(invoice: regenerated_invoice)
         regenerated_invoice.save!
       end
@@ -58,9 +65,17 @@ module Invoices
     private
 
     attr_accessor :regenerated_invoice
-    attr_reader :voided_invoice, :fees_params
+    attr_reader :voided_invoice, :fees_params, :purchase_order_number
 
     delegate :customer, to: :voided_invoice
+
+    def issuing_date
+      @issuing_date ||= Time.current.in_time_zone(customer.applicable_timezone).to_date
+    end
+
+    def payment_due_date
+      @payment_due_date ||= issuing_date + customer.applicable_net_payment_term.days
+    end
 
     def should_create_credit_note_credit?
       return false unless regenerated_invoice.total_amount_cents&.positive?
@@ -177,11 +192,26 @@ module Invoices
       end
     end
 
+    def assign_applied_usage_thresholds
+      return unless voided_invoice.progressive_billing?
+
+      voided_invoice.applied_usage_thresholds.find_each do |applied_usage_threshold|
+        applied_usage_threshold.dup.tap do |duplicate|
+          duplicate.invoice = regenerated_invoice
+          duplicate.save!
+        end
+      end
+    end
+
+    def voided_invoice_fees
+      @voided_invoice_fees ||= voided_invoice.fees.where(id: fees_params.map { |fee| fee[:id] }.compact).index_by(&:id)
+    end
+
     def process_fees
       fees_params.each do |fee_params|
         if fee_params[:id].present?
-          voided_fee = voided_invoice.fees.find_by(id: fee_params[:id])
-          dep_fee = duplicate_fee(voided_fee) if voided_fee
+          voided_fee = voided_invoice_fees[fee_params[:id]]
+          dup_fee = duplicate_fee(voided_fee, fee_params) if voided_fee
         end
 
         adjusted_fee_params = {
@@ -192,17 +222,17 @@ module Invoices
           subscription_id: fee_params[:subscription_id]
         }
         adjusted_fee_params[:unit_precise_amount] = fee_params[:unit_amount_cents] if fee_params[:unit_amount_cents].present?
-        adjusted_fee_params[:fee_id] = dep_fee.id if dep_fee
+        adjusted_fee_params[:fee_id] = dup_fee.id if dup_fee
 
-        AdjustedFees::CreateService.call(
+        AdjustedFees::CreateService.call!(
           invoice: regenerated_invoice,
           params: adjusted_fee_params,
-          preview: true
+          regenerating_voided: true
         )
       end
     end
 
-    def duplicate_fee(voided_fee)
+    def duplicate_fee(voided_fee, fee_params)
       dup_fee = voided_fee.dup
       dup_fee.invoice = regenerated_invoice
       dup_fee.payment_status = :pending
@@ -211,8 +241,26 @@ module Invoices
       dup_fee.precise_coupons_amount_cents = 0
       dup_fee.taxes_base_rate = 0
       dup_fee.taxes_rate = 0
+      dup_fee.original_fee = voided_fee.original_fee || voided_fee
       dup_fee.save!
+
+      return dup_fee if adjusting_units?(voided_fee, fee_params)
+
+      voided_fee.presentation_breakdowns.each do |breakdown|
+        dup_fee.presentation_breakdowns.create!(
+          organization_id: breakdown.organization_id,
+          presentation_by: breakdown.presentation_by,
+          units: breakdown.units
+        )
+      end
+
       dup_fee
+    end
+
+    def adjusting_units?(voided_fee, fee_params)
+      return true if fee_params[:units].blank?
+
+      BigDecimal(fee_params[:units].to_s) != voided_fee.units
     end
 
     def create_invoice_subscriptions
@@ -232,9 +280,23 @@ module Invoices
         customer: voided_invoice.customer,
         invoice_type: voided_invoice.invoice_type,
         currency: voided_invoice.currency,
-        datetime: voided_invoice.created_at
+        datetime: voided_invoice.created_at,
+        billing_entity: voided_invoice.billing_entity
       ).invoice.tap do |invoice|
-        invoice.update!(voided_invoice_id: voided_invoice.id)
+        invoice.update!(
+          voided_invoice_id: voided_invoice.id,
+          purchase_order_number: resolved_purchase_order_number
+        )
+
+        Invoices::RefreshSearchTermsService.call!(invoice:)
+      end
+    end
+
+    def resolved_purchase_order_number
+      if purchase_order_number == :inherit
+        voided_invoice.purchase_order_number
+      else
+        purchase_order_number
       end
     end
 
@@ -251,7 +313,7 @@ module Invoices
     end
 
     def should_deliver_email?
-      License.premium? && customer.billing_entity.email_settings.include?("invoice.finalized")
+      License.premium? && regenerated_invoice.billing_entity.email_settings.include?("invoice.finalized")
     end
   end
 end

@@ -8,6 +8,7 @@ RSpec.describe Invoice do
   let(:organization) { create(:organization) }
 
   it_behaves_like "paper_trail traceable"
+  it_behaves_like "a model with a purchase order number"
 
   it { is_expected.to have_many(:integration_resources) }
   it { is_expected.to have_many(:error_details) }
@@ -23,6 +24,29 @@ RSpec.describe Invoice do
   it { is_expected.to have_many(:applied_usage_thresholds) }
   it { is_expected.to have_many(:usage_thresholds).through(:applied_usage_thresholds) }
   it { is_expected.to have_one(:regenerated_invoice).class_name("Invoice").with_foreign_key(:voided_invoice_id) }
+  it { is_expected.to have_many(:invoice_connections).dependent(:destroy) }
+  it { is_expected.to have_one(:payment_connection).class_name("InvoiceConnection") }
+  it { is_expected.to have_one(:tax_connection).class_name("InvoiceConnection") }
+  it { is_expected.to have_one(:accounting_connection).class_name("InvoiceConnection") }
+  it { is_expected.to have_one(:crm_connection).class_name("InvoiceConnection") }
+
+  describe "per-category connection snapshots" do
+    subject(:invoice) { create(:invoice, organization:, customer:) }
+
+    let(:customer) { create(:customer, organization:) }
+    let!(:payment) { create(:invoice_connection, invoice:, organization:, category: :payment) }
+    let!(:tax) do
+      create(:invoice_connection, invoice:, organization:, category: :tax, payment_provider_customer: nil,
+        integration_customer: create(:anrok_customer, customer:, organization:))
+    end
+
+    it "exposes each snapshot by category" do
+      expect(invoice.payment_connection).to eq(payment)
+      expect(invoice.tax_connection).to eq(tax)
+      expect(invoice.accounting_connection).to be_nil
+      expect(invoice.crm_connection).to be_nil
+    end
+  end
 
   describe "Clickhouse associations", clickhouse: true do
     it { is_expected.to have_many(:activity_logs).class_name("Clickhouse::ActivityLog") }
@@ -33,8 +57,27 @@ RSpec.describe Invoice do
 
   it "has fixed status mapping" do
     expect(described_class::VISIBLE_STATUS).to match(draft: 0, finalized: 1, voided: 2, failed: 4, pending: 7)
-    expect(described_class::INVISIBLE_STATUS).to match(generating: 3, open: 5, closed: 6)
-    expect(described_class::STATUS).to match(draft: 0, finalized: 1, voided: 2, generating: 3, failed: 4, open: 5, closed: 6, pending: 7)
+    expect(described_class::INVISIBLE_STATUS).to match(generating: 3, open: 5, closed: 6, deleted: 8)
+    expect(described_class::STATUS).to match(draft: 0, finalized: 1, voided: 2, generating: 3, failed: 4, open: 5, closed: 6, pending: 7, deleted: 8)
+  end
+
+  describe "deleted status" do
+    it "is invisible and not a generated status" do
+      invoice = create(:invoice, :deleted)
+
+      expect(invoice).to be_invisible
+      expect(described_class.invisible).to include(invoice)
+      expect(described_class.visible).not_to include(invoice)
+      expect(described_class::GENERATED_INVOICE_STATUSES).not_to include("deleted")
+    end
+
+    it "can be reached from draft but not from finalized" do
+      draft = create(:invoice, :draft)
+      finalized = create(:invoice, status: :finalized)
+
+      expect(draft.may_mark_as_deleted?).to be(true)
+      expect(finalized.may_mark_as_deleted?).to be(false)
+    end
   end
 
   describe "validation" do
@@ -89,6 +132,10 @@ RSpec.describe Invoice do
     end
   end
 
+  it_behaves_like "a model with a purchase order number" do
+    subject { build(:invoice) }
+  end
+
   describe "finalized_at" do
     let(:invoice) { create(:invoice, :draft) }
 
@@ -97,6 +144,31 @@ RSpec.describe Invoice do
         invoice.finalized!
 
         expect(invoice.finalized_at).to eq(Time.current)
+      end
+    end
+  end
+
+  describe "#progressive_billing_last_applied_usage_threshold" do
+    context "when invoice is progressive billing" do
+      let(:invoice) { create(:invoice, invoice_type: :progressive_billing) }
+
+      it "returns the last applied usage threshold" do
+        create(:applied_usage_threshold, invoice:, organization:, created_at: 2.days.ago)
+        applied_usage_threshold = create(:applied_usage_threshold, invoice:, organization:, created_at: 1.day.ago)
+
+        expect(invoice.progressive_billing_last_applied_usage_threshold).to eq(applied_usage_threshold)
+      end
+
+      it "returns nil when no applied usage threshold exists" do
+        expect(invoice.progressive_billing_last_applied_usage_threshold).to be_nil
+      end
+    end
+
+    context "when invoice is not progressive billing" do
+      it "returns nil" do
+        create(:applied_usage_threshold, invoice:, organization:)
+
+        expect(invoice.progressive_billing_last_applied_usage_threshold).to be_nil
       end
     end
   end
@@ -170,6 +242,36 @@ RSpec.describe Invoice do
         expect(invoice.sequential_id).to eq(1)
         expect(invoice.billing_entity_sequential_id).to be_nil
         expect(invoice.organization_sequential_id).to be_zero
+      end
+    end
+
+    context "when the same customer has invoices across multiple billing entities" do
+      let(:billing_entity_2) { create(:billing_entity, organization:) }
+
+      before do
+        create(:invoice, customer:, organization:, billing_entity:, sequential_id: 1, billing_entity_sequential_id: 1, organization_sequential_id: 0)
+        create(:invoice, customer:, organization:, billing_entity:, sequential_id: 2, billing_entity_sequential_id: 2, organization_sequential_id: 0)
+        create(:invoice, customer:, organization:, billing_entity: billing_entity_2, sequential_id: 1, billing_entity_sequential_id: 1, organization_sequential_id: 0)
+      end
+
+      it "scopes sequential_id per (customer, billing_entity)" do
+        invoice_in_entity_2 = build(
+          :invoice,
+          customer:,
+          organization:,
+          billing_entity: billing_entity_2,
+          billing_entity_sequential_id: nil,
+          organization_sequential_id: 0,
+          status: :generating
+        )
+        invoice_in_entity_2.save!
+        invoice_in_entity_2.finalized!
+
+        invoice.save!
+        invoice.finalized!
+
+        expect(invoice_in_entity_2.sequential_id).to eq(2)
+        expect(invoice.sequential_id).to eq(3)
       end
     end
 
@@ -1047,44 +1149,170 @@ RSpec.describe Invoice do
         expect(invoice.recurring_breakdown(fee)).to eq([])
       end
     end
+
+    context "with events on a prorated recurring charge" do
+      let(:organization) { create(:organization) }
+      let(:customer) { create(:customer, organization:) }
+      let(:invoice) { create(:invoice, organization:, customer:) }
+      let(:charge) { create(:standard_charge, organization:, plan: subscription.plan, billable_metric:, prorated: true) }
+
+      let(:subscription) do
+        create(
+          :subscription,
+          organization:,
+          customer:,
+          subscription_at: Time.zone.parse("2022-12-01 00:00:00"),
+          started_at: Time.zone.parse("2022-12-01 00:00:00"),
+          billing_time: :anniversary
+        )
+      end
+
+      let(:fee) do
+        create(
+          :charge_fee,
+          organization:,
+          invoice:,
+          subscription:,
+          charge:,
+          properties: {
+            "charges_from_datetime" => "2023-05-01T00:00:00Z",
+            "charges_to_datetime" => "2023-05-31T23:59:59Z",
+            "charges_duration" => 31
+          }
+        )
+      end
+
+      context "when the billable metric is a sum_agg" do
+        let(:billable_metric) do
+          create(:sum_billable_metric, organization:, field_name: "total_count", recurring: true)
+        end
+
+        before do
+          create(
+            :event,
+            organization:,
+            subscription:,
+            code: billable_metric.code,
+            timestamp: Time.zone.parse("2023-04-10 00:00:00"),
+            properties: {"total_count" => 12}
+          )
+          create(
+            :event,
+            organization:,
+            subscription:,
+            code: billable_metric.code,
+            timestamp: Time.zone.parse("2023-05-11 00:00:00"),
+            properties: {"total_count" => 5}
+          )
+        end
+
+        it "returns the persisted units and the units added during the period" do
+          breakdown = invoice.recurring_breakdown(fee)
+
+          expect(breakdown.map { |item| [item.date.to_s, item.action, item.amount.to_i, item.duration, item.total_duration] })
+            .to eq(
+              [
+                ["2023-05-01", "add", 12, 31, 31],
+                ["2023-05-11", "add", 5, 21, 31]
+              ]
+            )
+        end
+      end
+
+      context "when the billable metric is a unique_count_agg" do
+        let(:billable_metric) do
+          create(:unique_count_billable_metric, organization:, field_name: "unique_id", recurring: true)
+        end
+
+        before do
+          create(
+            :event,
+            organization:,
+            subscription:,
+            code: billable_metric.code,
+            timestamp: Time.zone.parse("2023-04-10 00:00:00"),
+            properties: {"unique_id" => "111"}
+          )
+          create(
+            :event,
+            organization:,
+            subscription:,
+            code: billable_metric.code,
+            timestamp: Time.zone.parse("2023-05-11 00:00:00"),
+            properties: {"unique_id" => "222"}
+          )
+        end
+
+        it "returns the persisted item and the item added during the period" do
+          breakdown = invoice.recurring_breakdown(fee)
+
+          expect(breakdown.map { |item| [item.date.to_s, item.action, item.amount, item.duration, item.total_duration] })
+            .to eq(
+              [
+                ["2023-05-01", "add", 1, 31, 31],
+                ["2023-05-11", "add", 1, 21, 31]
+              ]
+            )
+        end
+      end
+
+      context "when the aggregation type is not supported" do
+        let(:billable_metric) { create(:weighted_sum_billable_metric, organization:, recurring: true) }
+        let(:charge) { create(:standard_charge, organization:, plan: subscription.plan, billable_metric:) }
+
+        it "raises a NotImplementedError" do
+          expect { invoice.recurring_breakdown(fee) }.to raise_error(NotImplementedError)
+        end
+      end
+    end
   end
 
   describe "#document_invoice_name" do
     let(:organization) { create(:organization, name: "LAGO", country: "FR") }
+    let(:billing_entity) { create(:billing_entity, organization:, country: "FR") }
     let(:customer) { create(:customer, organization:) }
-    let(:invoice) { create(:invoice, customer:, organization:) }
+    let(:invoice) { create(:invoice, customer:, organization:, billing_entity:) }
 
     it "returns the correct name for EU country" do
       expect(invoice.document_invoice_name).to eq("Invoice")
     end
 
     context "when invoice is self billed" do
-      let(:invoice) { create(:invoice, :self_billed, customer:, organization:) }
+      let(:invoice) { create(:invoice, :self_billed, customer:, organization:, billing_entity:) }
 
       it "returns the correct name for EU country" do
         expect(invoice.document_invoice_name).to eq("Self-billing invoice")
       end
     end
 
-    context "when organization country is Australia" do
-      let(:organization) { create(:organization, name: "LAGO", country: "AU") }
+    context "when billing entity country is Australia" do
+      let(:billing_entity) { create(:billing_entity, organization:, country: "AU") }
 
       it "returns the correct name that includes keyword tax" do
         expect(invoice.document_invoice_name).to eq("Tax invoice")
       end
     end
 
-    context "when the organization country is in TAX_INVOICE_LABEL_COUNTRIES" do
+    context "when the billing entity country is in TAX_INVOICE_LABEL_COUNTRIES" do
       let(:country) { Invoice::TAX_INVOICE_LABEL_COUNTRIES.sample }
-      let(:organization) { create(:organization, name: "LAGO", country:) }
+      let(:billing_entity) { create(:billing_entity, organization:, country:) }
 
       it "returns the correct tax invoice name" do
         expect(invoice.document_invoice_name).to eq(I18n.t("invoice.document_tax_name"))
       end
     end
 
+    context "when the billing entity country differs from the organization country" do
+      let(:organization) { create(:organization, name: "LAGO", country: "FR") }
+      let(:billing_entity) { create(:billing_entity, organization:, country: "SG") }
+
+      it "uses the billing entity country to determine the tax invoice name" do
+        expect(invoice.document_invoice_name).to eq("Tax invoice")
+      end
+    end
+
     context "when it is credit invoice" do
-      let(:invoice) { create(:invoice, customer:, organization:, invoice_type: :credit) }
+      let(:invoice) { create(:invoice, customer:, organization:, billing_entity:, invoice_type: :credit) }
 
       it "returns the correct name for EU country" do
         expect(invoice.document_invoice_name).to eq("Advance invoice")
@@ -1136,6 +1364,47 @@ RSpec.describe Invoice do
       end
 
       context "when subscription is gated" do
+        let(:subscription) { create(:subscription, :incomplete) }
+
+        before do
+          create(:subscription_activation_rule, subscription:, status: "pending")
+        end
+
+        it { is_expected.to be(true) }
+      end
+
+      context "when subscription is not gated" do
+        let(:subscription) { create(:subscription, :incomplete) }
+
+        it { is_expected.to be(false) }
+      end
+    end
+  end
+
+  describe "#subscription_payment_gated?" do
+    subject(:subscription_payment_gated?) { invoice.subscription_payment_gated? }
+
+    before { invoice }
+
+    context "when invoice is not open" do
+      let(:invoice) { create(:invoice) }
+
+      it { is_expected.to be(false) }
+    end
+
+    context "when invoice is open" do
+      let(:invoice) do
+        create(
+          :invoice,
+          :open,
+          :with_subscriptions,
+          subscriptions: [subscription],
+          organization: subscription.organization,
+          customer: subscription.customer
+        )
+      end
+
+      context "when subscription is payment-gated" do
         let(:subscription) { create(:subscription, :incomplete) }
 
         before do
@@ -1811,6 +2080,26 @@ RSpec.describe Invoice do
 
       expect(xml_url).to be_present
       expect(xml_url).to include(ENV["LAGO_API_URL"])
+    end
+  end
+
+  describe "#web_url" do
+    it "returns the lago frontend url of the invoice overview page" do
+      expect(invoice.web_url).to eq(
+        URI.join(
+          Rails.application.config.lago_front_url,
+          "/#{invoice.organization.slug}/customer/#{invoice.customer_id}/",
+          "invoice/#{invoice.id}/overview"
+        ).to_s
+      )
+    end
+
+    context "when the invoice is not visible" do
+      let(:invoice) { create(:invoice, status: :closed) }
+
+      it "returns nil" do
+        expect(invoice.web_url).to be_nil
+      end
     end
   end
 

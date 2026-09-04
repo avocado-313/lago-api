@@ -51,6 +51,30 @@ RSpec.describe BillableMetric do
     end
   end
 
+  describe "#reset_field_name_for_count_agg" do
+    it "clears the field_name when the aggregation type is count_agg" do
+      billable_metric = build(:billable_metric, aggregation_type: :count_agg, field_name: "custom_field")
+
+      expect(billable_metric).to be_valid
+      expect(billable_metric.field_name).to be_nil
+    end
+
+    it "drops a stale field_name when switching an existing metric to count_agg" do
+      billable_metric = create(:sum_billable_metric, field_name: "custom_field")
+
+      billable_metric.update!(aggregation_type: :count_agg)
+
+      expect(billable_metric.reload.field_name).to be_nil
+    end
+
+    it "keeps the field_name for aggregation types that use it" do
+      billable_metric = build(:sum_billable_metric, field_name: "custom_field")
+
+      expect(billable_metric).to be_valid
+      expect(billable_metric.field_name).to eq("custom_field")
+    end
+  end
+
   describe "#validate_recurring" do
     let(:recurring) { false }
     let(:billable_metric) { build(:max_billable_metric, recurring:) }
@@ -114,6 +138,36 @@ RSpec.describe BillableMetric do
       (described_class::AGGREGATION_TYPES.keys - described_class::AGGREGATION_TYPES_PAYABLE_IN_ADVANCE).each do |agg|
         expect(build(:billable_metric, aggregation_type: agg)).not_to be_payable_in_advance
       end
+    end
+  end
+
+  describe "#attached_subscriptions" do
+    subject(:billable_metric) { create(:billable_metric, organization:) }
+
+    let(:organization) { create(:organization) }
+    let(:plan) { create(:plan, organization:) }
+    let(:other_plan) { create(:plan, organization:) }
+
+    it "returns subscriptions of plans that have a charge for this billable metric" do
+      create(:standard_charge, billable_metric:, plan:, organization:)
+      attached_subscription = create(:subscription, plan:, organization:)
+      create(:subscription, plan: other_plan, organization:)
+
+      expect(billable_metric.attached_subscriptions).to contain_exactly(attached_subscription)
+    end
+
+    it "returns an empty relation when no charge references the billable metric" do
+      create(:subscription, plan:, organization:)
+
+      expect(billable_metric.attached_subscriptions).to be_empty
+    end
+
+    it "returns a chainable ActiveRecord relation" do
+      create(:standard_charge, billable_metric:, plan:, organization:)
+      create(:subscription, plan:, organization:)
+      create(:subscription, :terminated, plan:, organization:)
+
+      expect(billable_metric.attached_subscriptions.active.count).to eq(1)
     end
   end
 end
